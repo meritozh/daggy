@@ -60,18 +60,11 @@ impl AppState {
     /// Restore only when a previous root exists. A true first launch remains a
     /// calm empty state instead of immediately interrupting with a picker.
     pub fn restore_last_root(&mut self, cx: &mut Context<Self>) {
-        let task = cx
-            .background_executor()
-            .spawn(async { daggy_cache::load_last_root() });
-        let state = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            if let Ok(Some(path)) = task.await {
-                if path.is_dir() {
-                    let _ = state.update(cx, |state, cx| state.open_path(path, cx));
-                }
-            }
-        })
-        .detach();
+        match daggy_cache::load_last_root() {
+            Ok(Some(path)) if path.is_dir() => self.open_path(path, cx),
+            Ok(_) => {}
+            Err(error) => log::warn!("recent root load failed: {error}"),
+        }
     }
 
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {

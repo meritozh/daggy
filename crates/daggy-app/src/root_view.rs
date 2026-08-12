@@ -43,7 +43,10 @@ struct WorkspaceRender<'a> {
 impl RootView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
-        state.update(cx, |state, cx| state.restore_last_root(cx));
+        let restoring_state = state.clone();
+        cx.defer(move |cx| {
+            restoring_state.update(cx, |state, cx| state.restore_last_root(cx));
+        });
         Self {
             state,
             sunburst: Sunburst::new(),
