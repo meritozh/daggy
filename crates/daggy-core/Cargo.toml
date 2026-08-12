@@ -12,7 +12,5 @@ rustc-hash = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
-# macOS fast-path bulk directory enumeration.
 [target.'cfg(target_os = "macos")'.dependencies]
-getattrlistbulk = { workspace = true }
 libc = { workspace = true }

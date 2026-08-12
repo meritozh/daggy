@@ -1,16 +1,15 @@
-//! Arena-backed directory tree.
-//!
-//! Nodes live in a flat `Vec` (a slotmap-style arena) rather than a recursive
-//! `Box` tree. This keeps the structure cache-friendly, cheap to clone for UI
-//! snapshots, and trivial to serialize flat into the on-disk cache.
+//! Cache-friendly arena tree and compact read projections.
 
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-/// A cheap, stable handle to a node. `u32` so it copies for free through GPUI
-/// click handlers.
+use rustc_hash::FxHashMap;
+
+/// A stable handle to a node inside one scan generation.
 pub type NodeId = u32;
 
-/// Entry kind. Kept small (a byte) since it's stored per-node in the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
@@ -22,59 +21,44 @@ pub enum Kind {
 
 impl Kind {
     pub fn is_dir(self) -> bool {
-        matches!(self, Kind::Dir)
+        matches!(self, Self::Dir)
     }
 }
 
-/// Per-node scan progress. Drives both the UI (shimmer on in-progress dirs)
-/// and cache invalidation (only `Unscanned`/dirty subtrees get re-walked).
+/// Direct-enumeration state. `complete` on [`Node`] separately records whether
+/// every descendant has finished, which prevents a partial size looking final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanState {
-    /// Never scanned. Cache hits start here for subtrees that changed.
     Unscanned,
-    /// Scan in progress; `child_count` entries found so far.
-    Scanning {
-        child_count: u32,
-    },
-    /// Fully scanned; all direct children are present in the arena.
-    Scanned {
-        child_count: u32,
-    },
-    /// Could not be read (permissions, broken symlink, …).
+    Scanning { child_count: u32 },
+    Scanned { child_count: u32 },
     Error,
 }
 
-/// A single filesystem entry in the tree.
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: NodeId,
     pub parent: Option<NodeId>,
-    /// Last path component. The root node carries the full path.
-    pub name: Arc<str>,
+    /// Last path component. The root stores the full selected path.
+    pub name: Arc<OsStr>,
     pub kind: Kind,
-    /// Apparent size in bytes. For directories this is the (lazily recomputed)
-    /// sum of descendant sizes.
     pub size: u64,
-    /// On-disk allocated size (`st_blocks * 512`).
     pub block_size: u64,
-    /// Modification time in seconds since the epoch. Cache invalidation key.
-    pub mtime: u64,
-    /// Inode number, used to deduplicate hardlinks.
+    pub mtime: i64,
     pub inode: u64,
-    /// Device id (combined with inode to identify hardlinks uniquely).
     pub dev: u64,
     pub state: ScanState,
-    /// Direct child ids, in scan (i.e. arbitrary) order. Empty until scanned.
+    /// True only when this node and all descendants are accounted for.
+    pub complete: bool,
     pub children: Vec<NodeId>,
 }
 
 impl Node {
-    /// Create a directory node that hasn't been scanned yet.
-    pub fn unscanned_dir(id: NodeId, parent: Option<NodeId>, name: Arc<str>) -> Self {
-        Node {
+    pub fn unscanned_dir(id: NodeId, parent: Option<NodeId>, name: impl Into<Arc<OsStr>>) -> Self {
+        Self {
             id,
             parent,
-            name,
+            name: name.into(),
             kind: Kind::Dir,
             size: 0,
             block_size: 0,
@@ -82,17 +66,20 @@ impl Node {
             inode: 0,
             dev: 0,
             state: ScanState::Unscanned,
+            complete: false,
             children: Vec::new(),
         }
     }
+
+    pub fn display_name(&self) -> String {
+        self.name.to_string_lossy().into_owned()
+    }
 }
 
-/// The mutable tree, shared behind an `RwLock` by the scanner and UI.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Tree {
     nodes: Vec<Option<Node>>,
     free: Vec<NodeId>,
-    /// Index of the root node, if any.
     pub root: Option<NodeId>,
 }
 
@@ -101,7 +88,6 @@ impl Tree {
         Self::default()
     }
 
-    /// Allocate a fresh node id, reusing freed slots when possible.
     pub fn alloc(&mut self, mut node: Node) -> NodeId {
         if let Some(id) = self.free.pop() {
             node.id = id;
@@ -116,11 +102,11 @@ impl Tree {
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id as usize).and_then(|slot| slot.as_ref())
+        self.nodes.get(id as usize).and_then(Option::as_ref)
     }
 
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(id as usize).and_then(|slot| slot.as_mut())
+        self.nodes.get_mut(id as usize).and_then(Option::as_mut)
     }
 
     pub fn root(&self) -> Option<&Node> {
@@ -135,116 +121,350 @@ impl Tree {
         self.len() == 0
     }
 
-    /// Capacity of the underlying arena (max id ever assigned + 1). Used by
-    /// the cache to size its id remap table.
+    pub fn is_complete(&self) -> bool {
+        self.root().is_some_and(|node| node.complete)
+    }
+
     pub fn cap(&self) -> NodeId {
         self.nodes.len() as NodeId
     }
 
-    /// Iterate over live nodes (in id order, skipping freed slots).
     pub fn iter(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.iter().filter_map(|slot| slot.as_ref())
+        self.nodes.iter().filter_map(Option::as_ref)
     }
 
-    /// Replace the entire contents of this tree with `other`. Used when the
-    /// cache loads a tree to swap it into a scanner's shared tree.
-    pub fn load_from(&mut self, other: Tree) {
-        self.nodes = other.nodes;
-        self.free = other.free;
-        self.root = other.root;
-    }
-
-    /// Recompute a directory's `size`/`block_size` as the sum of its scanned
-    /// children, then propagate the delta up to the root. Called whenever a
-    /// subtree finishes scanning. O(depth) per update.
-    pub fn recompute_upward(&mut self, id: NodeId) {
-        // Sum the node's *scanned* children. Unscanned children contribute
-        // nothing yet — their sizes will fold in as they complete.
-        let (size, block_size) = {
-            let node = match self.get(id) {
-                Some(n) => n,
-                None => return,
-            };
-            if !node.kind.is_dir() {
-                return;
-            }
-            let mut size = 0u64;
-            let mut block_size = 0u64;
-            for &child in &node.children {
-                if let Some(c) = self.get(child) {
-                    size = size.saturating_add(c.size);
-                    block_size = block_size.saturating_add(c.block_size);
-                }
-            }
-            (size, block_size)
-        };
-
-        let delta_size;
-        let delta_block;
-        {
-            let node = match self.get_mut(id) {
-                Some(n) => n,
-                None => return,
-            };
-            delta_size = size.saturating_sub(node.size);
-            delta_block = block_size.saturating_sub(node.block_size);
-            node.size = size;
-            node.block_size = block_size;
+    pub fn path_of(&self, id: NodeId) -> Option<PathBuf> {
+        let mut components: Vec<Arc<OsStr>> = Vec::new();
+        let mut cursor = self.get(id);
+        while let Some(node) = cursor {
+            components.push(node.name.clone());
+            cursor = node.parent.and_then(|parent| self.get(parent));
         }
+        if components.is_empty() {
+            return None;
+        }
+        let mut path = PathBuf::new();
+        for component in components.into_iter().rev() {
+            path.push(component.as_ref());
+        }
+        Some(path)
+    }
 
-        // Propagate the (non-negative) delta to ancestors. A child completing
-        // can only ever grow an ancestor.
-        let mut cursor = self.get(id).and_then(|n| n.parent);
-        while let Some(pid) = cursor {
-            let node = match self.get_mut(pid) {
-                Some(n) => n,
+    /// Resolve an exact path through already discovered children without a
+    /// full arena scan. Missing descendants simply have not been reached yet.
+    pub fn find_path(&self, path: &Path) -> Option<NodeId> {
+        let root = self.root?;
+        let root_path = Path::new(self.get(root)?.name.as_ref());
+        let relative = path.strip_prefix(root_path).ok()?;
+        let mut current = root;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            current = self.get(current)?.children.iter().copied().find(|child| {
+                self.get(*child)
+                    .is_some_and(|node| node.name.as_ref() == name)
+            })?;
+        }
+        Some(current)
+    }
+
+    /// Recompute a directory and every ancestor. Scan generations only grow,
+    /// but this uses exact replacement so it also remains correct for tests and
+    /// future incremental invalidation.
+    pub fn recompute_upward(&mut self, id: NodeId) {
+        let mut cursor = Some(id);
+        while let Some(current) = cursor {
+            let (parent, totals) = match self.get(current) {
+                Some(node) if node.kind.is_dir() => {
+                    let mut apparent = 0u64;
+                    let mut allocated = 0u64;
+                    for child in &node.children {
+                        if let Some(child) = self.get(*child) {
+                            apparent = apparent.saturating_add(child.size);
+                            allocated = allocated.saturating_add(child.block_size);
+                        }
+                    }
+                    (node.parent, Some((apparent, allocated)))
+                }
+                Some(node) => (node.parent, None),
                 None => break,
             };
-            node.size = node.size.saturating_add(delta_size);
-            node.block_size = node.block_size.saturating_add(delta_block);
-            cursor = node.parent;
+            if let Some((apparent, allocated)) = totals {
+                if let Some(node) = self.get_mut(current) {
+                    node.size = apparent;
+                    node.block_size = allocated;
+                }
+            }
+            cursor = parent;
         }
     }
-}
 
-/// A cheap, coherent snapshot of the tree for the UI to render from. Clones
-/// the arena `Arc`-sharing the name strings so even huge trees copy quickly.
-#[derive(Debug, Clone)]
-pub struct TreeSnapshot {
-    pub nodes: Vec<Option<Node>>,
-    pub root: Option<NodeId>,
-}
-
-impl TreeSnapshot {
-    pub fn get(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id as usize).and_then(|slot| slot.as_ref())
+    /// Mark a completed leaf and propagate subtree completeness as far upward
+    /// as the direct-enumeration and descendant states permit.
+    pub fn mark_complete_upward(&mut self, id: NodeId) {
+        let mut cursor = Some(id);
+        while let Some(current) = cursor {
+            let (parent, complete) = match self.get(current) {
+                Some(node) => {
+                    let direct_done = matches!(node.state, ScanState::Scanned { .. });
+                    let descendants_done = node.children.iter().all(|child| {
+                        self.get(*child)
+                            .is_some_and(|child| !child.kind.is_dir() || child.complete)
+                    });
+                    (node.parent, direct_done && descendants_done)
+                }
+                None => break,
+            };
+            if let Some(node) = self.get_mut(current) {
+                node.complete = complete;
+            }
+            if !complete {
+                break;
+            }
+            cursor = parent;
+        }
     }
 
-    pub fn root(&self) -> Option<&Node> {
-        self.root.and_then(|id| self.get(id))
-    }
+    /// Build only the data the current view can display. This avoids cloning a
+    /// million-node arena on every GPUI paint while keeping the cache tree exact.
+    pub fn projection(
+        &self,
+        focus: Option<NodeId>,
+        chart_depth: usize,
+        branch_limit: usize,
+        chart_budget: usize,
+        row_limit: usize,
+    ) -> TreeProjection {
+        let focus = focus.filter(|id| self.get(*id).is_some()).or(self.root);
+        let root = self.root().map(NodeView::from);
+        let Some(focus_id) = focus else {
+            return TreeProjection::empty();
+        };
 
-    /// Capacity of the snapshot's node array (max id + 1).
-    pub fn cap(&self) -> NodeId {
-        self.nodes.len() as NodeId
-    }
+        let mut ancestors = Vec::new();
+        let mut cursor = self.get(focus_id);
+        while let Some(node) = cursor {
+            ancestors.push(NodeView::from(node));
+            cursor = node.parent.and_then(|parent| self.get(parent));
+        }
+        ancestors.reverse();
 
-    pub fn children(&self, id: NodeId) -> impl Iterator<Item = &Node> {
-        let ids = self
-            .get(id)
-            .map(|n| n.children.clone())
+        let focus_node = self.get(focus_id).map(NodeView::from);
+        let mut row_ids = self
+            .get(focus_id)
+            .map(|node| node.children.clone())
             .unwrap_or_default();
-        ids.into_iter().filter_map(move |c| self.get(c))
+        row_ids.sort_unstable_by(|a, b| {
+            let a = self.get(*a).map_or(0, |node| node.block_size);
+            let b = self.get(*b).map_or(0, |node| node.block_size);
+            b.cmp(&a)
+        });
+        let omitted_rows = row_ids.len().saturating_sub(row_limit);
+        let rows = row_ids
+            .into_iter()
+            .take(row_limit)
+            .filter_map(|id| self.get(id).map(NodeView::from))
+            .collect();
+
+        let mut chart = FxHashMap::default();
+        let mut queue = VecDeque::from([(focus_id, 0usize)]);
+        while let Some((id, depth)) = queue.pop_front() {
+            if chart.len() >= chart_budget {
+                break;
+            }
+            let Some(node) = self.get(id) else {
+                continue;
+            };
+            let mut children = Vec::new();
+            let mut omitted_size = 0u64;
+            let mut omitted_count = 0usize;
+            if depth < chart_depth {
+                let mut child_ids = node.children.clone();
+                child_ids.sort_unstable_by(|a, b| {
+                    let a = self.get(*a).map_or(0, |node| node.block_size);
+                    let b = self.get(*b).map_or(0, |node| node.block_size);
+                    b.cmp(&a)
+                });
+                for (index, child) in child_ids.into_iter().enumerate() {
+                    if index < branch_limit && chart.len() + queue.len() + 1 < chart_budget {
+                        children.push(child);
+                        queue.push_back((child, depth + 1));
+                    } else if let Some(child) = self.get(child) {
+                        omitted_size = omitted_size.saturating_add(child.block_size);
+                        omitted_count += 1;
+                    }
+                }
+            }
+            chart.insert(
+                id,
+                ChartNode {
+                    node: NodeView::from(node),
+                    children,
+                    omitted_size,
+                    omitted_count,
+                },
+            );
+        }
+
+        TreeProjection {
+            root,
+            focus,
+            focus_node,
+            ancestors,
+            rows,
+            omitted_rows,
+            chart,
+            total_nodes: self.len(),
+        }
     }
 }
 
-impl Tree {
-    /// Take a snapshot of the current tree. The nodes vector is cloned, but
-    /// each `name` is an `Arc<str>` so the string bytes are shared.
-    pub fn snapshot(&self) -> TreeSnapshot {
-        TreeSnapshot {
-            nodes: self.nodes.clone(),
-            root: self.root,
+#[derive(Debug, Clone)]
+pub struct NodeView {
+    pub id: NodeId,
+    pub parent: Option<NodeId>,
+    pub name: Arc<OsStr>,
+    pub kind: Kind,
+    pub size: u64,
+    pub block_size: u64,
+    pub state: ScanState,
+    pub complete: bool,
+    pub child_count: usize,
+}
+
+impl NodeView {
+    pub fn display_name(&self) -> String {
+        self.name.to_string_lossy().into_owned()
+    }
+}
+
+impl From<&Node> for NodeView {
+    fn from(node: &Node) -> Self {
+        Self {
+            id: node.id,
+            parent: node.parent,
+            name: node.name.clone(),
+            kind: node.kind,
+            size: node.size,
+            block_size: node.block_size,
+            state: node.state,
+            complete: node.complete,
+            child_count: node.children.len(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChartNode {
+    pub node: NodeView,
+    pub children: Vec<NodeId>,
+    pub omitted_size: u64,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeProjection {
+    pub root: Option<NodeView>,
+    pub focus: Option<NodeId>,
+    pub focus_node: Option<NodeView>,
+    pub ancestors: Vec<NodeView>,
+    pub rows: Vec<NodeView>,
+    pub omitted_rows: usize,
+    pub chart: FxHashMap<NodeId, ChartNode>,
+    pub total_nodes: usize,
+}
+
+impl TreeProjection {
+    pub fn empty() -> Self {
+        Self {
+            root: None,
+            focus: None,
+            focus_node: None,
+            ancestors: Vec::new(),
+            rows: Vec::new(),
+            omitted_rows: 0,
+            chart: FxHashMap::default(),
+            total_nodes: 0,
+        }
+    }
+
+    pub fn chart_node(&self, id: NodeId) -> Option<&ChartNode> {
+        self.chart.get(&id)
+    }
+}
+
+pub(crate) fn arc_os(value: OsString) -> Arc<OsStr> {
+    Arc::<OsStr>::from(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(parent: NodeId, name: &str, size: u64) -> Node {
+        Node {
+            id: 0,
+            parent: Some(parent),
+            name: Arc::from(OsStr::new(name)),
+            kind: Kind::File,
+            size,
+            block_size: size,
+            mtime: 0,
+            inode: size,
+            dev: 1,
+            state: ScanState::Scanned { child_count: 0 },
+            complete: true,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recompute_is_exact_when_values_shrink() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        let child = tree.alloc(file(root, "file", 100));
+        tree.get_mut(root).unwrap().children.push(child);
+        tree.recompute_upward(root);
+        assert_eq!(tree.root().unwrap().size, 100);
+        tree.get_mut(child).unwrap().size = 40;
+        tree.get_mut(child).unwrap().block_size = 40;
+        tree.recompute_upward(child);
+        assert_eq!(tree.root().unwrap().size, 40);
+    }
+
+    #[test]
+    fn completeness_propagates_from_leaf_directory() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        let child = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(root),
+            Arc::from(OsStr::new("a")),
+        ));
+        tree.get_mut(root).unwrap().children.push(child);
+        tree.get_mut(root).unwrap().state = ScanState::Scanned { child_count: 1 };
+        tree.get_mut(child).unwrap().state = ScanState::Scanned { child_count: 0 };
+        tree.mark_complete_upward(child);
+        assert!(tree.get(child).unwrap().complete);
+        assert!(tree.root().unwrap().complete);
+    }
+
+    #[test]
+    fn projection_caps_rows_and_keeps_largest_first() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        for (name, size) in [("small", 2), ("large", 9), ("mid", 4)] {
+            let id = tree.alloc(file(root, name, size));
+            tree.get_mut(root).unwrap().children.push(id);
+        }
+        tree.recompute_upward(root);
+        let projection = tree.projection(Some(root), 3, 32, 128, 2);
+        assert_eq!(projection.rows.len(), 2);
+        assert_eq!(projection.rows[0].display_name(), "large");
+        assert_eq!(projection.omitted_rows, 1);
     }
 }

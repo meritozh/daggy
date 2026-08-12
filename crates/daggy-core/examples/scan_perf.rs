@@ -1,32 +1,35 @@
-use daggy_core::{Scanner, ScanEvent};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use daggy_core::{fmt, ScanEvent, Scanner};
+
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/Users".into());
-    let scanner = Scanner::new();
-    let t0 = Instant::now();
+    let path = std::env::args().nth(1).unwrap_or_else(|| ".".into());
+    let workers = std::env::args()
+        .nth(2)
+        .and_then(|workers| workers.parse::<usize>().ok());
+    let scanner = workers.map_or_else(Scanner::new, Scanner::with_worker_count);
+    let started = Instant::now();
     let handle = scanner.scan_root(PathBuf::from(&path));
-    let mut items = 0u64;
-    let mut dirs = 0u64;
-    while let Ok(ev) = handle.events.recv_blocking() {
-        match ev {
-            ScanEvent::Progress { dirs_scanned, items_total } => {
-                dirs += dirs_scanned;
-                items += items_total;
-            }
-            ScanEvent::ScanFinished { .. } => break,
-            _ => {}
+    let summary = loop {
+        match handle.events.recv_blocking() {
+            Ok(ScanEvent::ScanFinished { summary, .. }) => break summary,
+            Ok(_) => {}
+            Err(_) => panic!("scan stopped before completion"),
         }
-    }
-    let phase1 = t0.elapsed();
-    let snap = scanner.snapshot();
-    let root = snap.root().unwrap();
+    };
+    let tree = scanner.tree_handle();
+    let tree = tree.read();
+    let root = tree.root().expect("scan root");
     println!(
-        "phase1: {:?}  root={}  dirs(top2)={}  items={}",
-        phase1,
-        daggy_core::fmt::human_bytes(root.size),
-        dirs,
-        items
+        "full: {:?}  allocated={}  apparent={}  dirs={}  items={}  nodes={}  errors={}  workers={}",
+        started.elapsed(),
+        fmt::human_bytes(root.block_size),
+        fmt::human_bytes(root.size),
+        summary.dirs_scanned,
+        summary.items_seen,
+        tree.len(),
+        summary.errors,
+        summary.workers,
     );
 }

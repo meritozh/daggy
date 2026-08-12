@@ -1,212 +1,235 @@
-//! The lazy, parallel directory scanner.
+//! Visible-first, background-complete disk scanner.
 //!
-//! Design (see the project README for the rationale):
-//!
-//! - **Fast enumeration** uses the macOS `getattrlistbulk` syscall (one bulk
-//!   call returns many entries *and* their metadata), with a portable
-//!   `std::fs` fallback for other platforms.
-//! - **Parallelism** is bounded by a 64-wide semaphore so we never spawn
-//!   thousands of concurrent operations — keeping CPU low while idle.
-//! - **Hardlinks** are deduplicated via a sharded inode set keyed on
-//!   `(dev, inode)`.
-//! - **Laziness**: `scan_root` populates the top two levels; `expand` walks a
-//!   single subtree on demand. Each directory is scanned at most once.
-//! - **Progress** flows out through an `smol` channel of `ScanEvent`s that the
-//!   UI observes to render incrementally.
-//!
-//! The recursive walk itself is synchronous (OS threads, not async), which
-//! keeps `parking_lot` guards off any async state machine and makes the whole
-//! engine straightforwardly `Send`. The `smol` channel bridges worker threads
-//! to the GPUI main-thread consumer.
+//! One coordinator owns each immutable scan generation. A fixed worker pool
+//! pulls from urgent and background queues, so a click can promote the visible
+//! subtree without creating recursive threads. UI notifications are bounded
+//! and coalesced; the exact tree remains behind a read lock for cache export.
 
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use smol::channel::{self, Receiver, Sender};
 
 use crate::inode_set::ShardedInodeSet;
-use crate::tree::{Kind, Node, NodeId, ScanState, Tree, TreeSnapshot};
+use crate::tree::{arc_os, Kind, Node, NodeId, ScanState, Tree, TreeProjection};
 
-/// Maximum number of directories scanned concurrently. 64 matches the fastest
-/// macOS disk scanners and keeps the kernel's directory cache warm without
-/// thrashing.
-const MAX_CONCURRENT_DIRS: usize = 64;
+const MAX_WORKERS: usize = 4;
+const MAX_BACKGROUND_WORKERS: usize = 2;
+const INITIAL_VISIBLE_DEPTH: u8 = 2;
+const EVENT_CAPACITY: usize = 256;
+const PROGRESS_EVERY_DIRS: u64 = 32;
 
-/// A single progress notification emitted by the scanner. The UI subscribes to
-/// these and re-renders the affected nodes incrementally.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
-    /// A directory has finished scanning; its children are now in the tree.
-    DirCompleted { id: NodeId, child_count: u32 },
-    /// A directory's scan failed (permissions, IO error, …).
-    DirError { id: NodeId },
-    /// A root scan started (resets progress counters).
-    ScanStarted { root: NodeId },
-    /// A root scan is fully done.
-    ScanFinished { root: NodeId },
-    /// Running counters for the status bar.
+    ScanStarted {
+        root: NodeId,
+    },
+    /// The root's direct children exist, so a live first ring can be painted.
+    VisibleReady {
+        root: NodeId,
+    },
+    /// Absolute counters, safe even when intermediate notifications are dropped.
     Progress {
         dirs_scanned: u64,
-        items_total: u64,
+        items_seen: u64,
+        errors: u64,
+    },
+    ScanFinished {
+        root: NodeId,
+        summary: ScanSummary,
     },
 }
 
-/// A handle returned to the UI. Holds a receiver for progress events.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanSummary {
+    pub dirs_scanned: u64,
+    pub items_seen: u64,
+    pub errors: u64,
+    pub elapsed: Duration,
+    pub complete: bool,
+    pub workers: usize,
+}
+
 pub struct ScannerHandle {
+    pub generation: u64,
     pub events: Receiver<ScanEvent>,
-    /// Set to true when the scan is cancelled (drop the handle to stop).
-    pub cancel: Arc<AtomicBool>,
 }
 
-impl ScannerHandle {
-    /// Request cancellation. In-flight directory reads finish, but no new
-    /// subtrees are descended into.
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
-/// The scanner owns the tree behind an `Arc<RwLock<Tree>>` so the UI can take
-/// cheap snapshots while scans run in the background.
 pub struct Scanner {
+    current: Mutex<Current>,
+    worker_count: usize,
+}
+
+struct Current {
     tree: Arc<RwLock<Tree>>,
-    inodes: Arc<ShardedInodeSet>,
-    /// Counting semaphore bounding concurrent directory scans.
-    sem: Arc<Semaphore>,
+    session: Option<Arc<Session>>,
 }
 
 impl Scanner {
     pub fn new() -> Self {
         Self {
-            tree: Arc::new(RwLock::new(Tree::new())),
-            inodes: Arc::new(ShardedInodeSet::new()),
-            sem: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRS)),
+            current: Mutex::new(Current {
+                tree: Arc::new(RwLock::new(Tree::new())),
+                session: None,
+            }),
+            worker_count: available_workers(),
         }
     }
 
-    pub fn tree(&self) -> Arc<RwLock<Tree>> {
-        self.tree.clone()
+    /// Override the bounded pool size for benchmarks or power-sensitive use.
+    /// Values are clamped to the same conservative production ceiling.
+    pub fn with_worker_count(worker_count: usize) -> Self {
+        Self {
+            current: Mutex::new(Current {
+                tree: Arc::new(RwLock::new(Tree::new())),
+                session: None,
+            }),
+            worker_count: worker_count.clamp(1, MAX_WORKERS),
+        }
     }
 
-    /// Replace the scanner's tree with a pre-built one (e.g. loaded from the
-    /// cache). Used by the UI on startup to restore a previous scan instantly.
-    pub fn load_tree(&self, tree: Tree) {
-        let mut t = self.tree.write();
-        t.load_from(tree);
-    }
-
-    /// A cheap coherent snapshot for rendering.
-    pub fn snapshot(&self) -> TreeSnapshot {
-        self.tree.read().snapshot()
-    }
-
-    /// Begin a fresh scan rooted at `path`. Replaces any existing tree.
-    ///
-    /// Phase 1: scan the root directory and one level of its directory children
-    /// so the UI can show something immediately. Deeper subtrees are scanned
-    /// lazily via [`Scanner::expand`] when the user drills into them.
-    ///
-    /// Returns a handle whose `events` receiver yields progress.
+    /// Start a new generation and cancel the old one. Old workers retain their
+    /// old tree, so late writes can never corrupt the newly selected root.
     pub fn scan_root(&self, path: PathBuf) -> ScannerHandle {
-        let (tx, rx) = channel::unbounded::<ScanEvent>();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let (events_tx, events_rx) = channel::bounded(EVENT_CAPACITY);
+        let mut tree = Tree::new();
+        let root_name = arc_os(path.as_os_str().to_os_string());
+        let root = tree.alloc(Node::unscanned_dir(0, None, root_name));
+        tree.root = Some(root);
+        if let Some(metadata) = dir_metadata(&path) {
+            let node = tree.get_mut(root).expect("new root exists");
+            node.mtime = metadata.mtime;
+            node.inode = metadata.inode;
+            node.dev = metadata.dev;
+        }
+        let tree = Arc::new(RwLock::new(tree));
+        let workers = self.worker_count;
+        let session = Arc::new(Session::new(root, tree.clone(), events_tx, workers));
+        session.enqueue(Job {
+            id: root,
+            path,
+            priority_depth: INITIAL_VISIBLE_DEPTH,
+        });
 
-        self.inodes.clear();
         {
-            let mut tree = self.tree.write();
-            *tree = Tree::new();
+            let mut current = self.current.lock().expect("scanner lock poisoned");
+            if let Some(old) = current.session.take() {
+                old.cancel();
+            }
+            current.tree = tree;
+            current.session = Some(session.clone());
         }
 
-        let root_id = {
-            let mut tree = self.tree.write();
-            let name: Arc<str> = path.to_string_lossy().into();
-            let id = tree.alloc(Node::unscanned_dir(0, None, name));
-            tree.root = Some(id);
-            id
-        };
+        let _ = session
+            .events
+            .send_blocking(ScanEvent::ScanStarted { root });
+        for index in 0..workers {
+            let session = session.clone();
+            thread::Builder::new()
+                .name(format!("daggy-scan-{index}"))
+                .spawn(move || worker_loop(session))
+                .expect("spawn bounded scan worker");
+        }
 
-        let ctx = ScanCtx {
-            tree: self.tree.clone(),
-            inodes: self.inodes.clone(),
-            sem: self.sem.clone(),
-            tx,
-            cancel: cancel.clone(),
-        };
-
-        // Spawn phase 1 on a worker thread: enumerate the root (level 0) and
-        // each of its directory children (level 1), without recursing deeper.
-        // The sunburst thus shows two rings immediately; deeper subtrees stay
-        // `Unscanned` for lazy `expand`.
-        let ctx_phase1 = ctx.clone();
-        std::thread::Builder::new()
-            .name("daggy-scan".into())
-            .spawn(move || {
-                let _ = ctx_phase1
-                    .tx
-                    .try_send(ScanEvent::ScanStarted { root: root_id });
-                enumerate_dir(&ctx_phase1, root_id, &path);
-
-                let child_dirs: Vec<(NodeId, PathBuf)> = {
-                    let tree = ctx_phase1.tree.read();
-                    let Some(root) = tree.get(root_id) else {
-                        let _ = ctx_phase1
-                            .tx
-                            .try_send(ScanEvent::ScanFinished { root: root_id });
-                        return;
-                    };
-                    root.children
-                        .iter()
-                        .filter_map(|&c| {
-                            let n = tree.get(c)?;
-                            n.kind.is_dir().then(|| (c, path.join(n.name.as_ref())))
-                        })
-                        .collect()
-                };
-                std::thread::scope(|s| {
-                    for (cid, cpath) in child_dirs {
-                        let ctx = ctx_phase1.clone();
-                        s.spawn(move || enumerate_dir(&ctx, cid, &cpath));
-                    }
-                });
-
-                let _ = ctx_phase1
-                    .tx
-                    .try_send(ScanEvent::ScanFinished { root: root_id });
-            })
-            .expect("spawn scan thread");
-
-        ScannerHandle { events: rx, cancel }
+        ScannerHandle {
+            generation,
+            events: events_rx,
+        }
     }
 
-    /// Lazily scan a single directory subtree. Called when the user expands a
-    /// node in the UI. No-op if the node is already scanned/scanning.
-    pub fn expand(&self, node: NodeId) -> ScannerHandle {
-        let (tx, rx) = channel::unbounded::<ScanEvent>();
-        let cancel = Arc::new(AtomicBool::new(false));
-
-        let path = {
-            let tree = self.tree.read();
-            tree.get(node).map(|n| path_of(&tree, n))
-        };
-
-        let ctx = ScanCtx {
-            tree: self.tree.clone(),
-            inodes: self.inodes.clone(),
-            sem: self.sem.clone(),
-            tx,
-            cancel: cancel.clone(),
-        };
-
-        if let Some(path) = path {
-            std::thread::Builder::new()
-                .name("daggy-expand".into())
-                .spawn(move || walk_subtree(&ctx, node, path))
-                .expect("spawn expand thread");
+    pub fn cancel_current(&self) {
+        let session = self
+            .current
+            .lock()
+            .expect("scanner lock poisoned")
+            .session
+            .clone();
+        if let Some(session) = session {
+            session.cancel();
         }
+    }
 
-        ScannerHandle { events: rx, cancel }
+    /// Promote the focused directory and its next two visible layers.
+    pub fn prioritize(&self, node: NodeId) {
+        let (tree, session) = {
+            let current = self.current.lock().expect("scanner lock poisoned");
+            (current.tree.clone(), current.session.clone())
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let job = {
+            let tree = tree.read();
+            let Some(node_ref) = tree.get(node) else {
+                return;
+            };
+            if !node_ref.kind.is_dir() || node_ref.complete {
+                return;
+            }
+            tree.path_of(node).map(|path| Job {
+                id: node,
+                path,
+                priority_depth: INITIAL_VISIBLE_DEPTH,
+            })
+        };
+        if let Some(job) = job {
+            session.enqueue(job);
+        }
+    }
+
+    /// Prioritize an exact cached/displayed path even when the fresh
+    /// generation has not discovered its deepest node yet.
+    pub fn prioritize_path(&self, path: PathBuf) {
+        let (tree, session) = {
+            let current = self.current.lock().expect("scanner lock poisoned");
+            (current.tree.clone(), current.session.clone())
+        };
+        let Some(session) = session else {
+            return;
+        };
+        session.prefer(path.clone());
+        let job = {
+            let tree = tree.read();
+            tree.find_path(&path).and_then(|id| {
+                let node = tree.get(id)?;
+                (!node.complete && node.kind.is_dir()).then_some(Job {
+                    id,
+                    path,
+                    priority_depth: INITIAL_VISIBLE_DEPTH,
+                })
+            })
+        };
+        if let Some(job) = job {
+            session.enqueue(job);
+        }
+    }
+
+    pub fn projection(&self, focus: Option<NodeId>) -> TreeProjection {
+        let tree = self.tree_handle();
+        let projection = tree.read().projection(focus, 3, 32, 4096, 2000);
+        projection
+    }
+
+    pub fn tree_handle(&self) -> Arc<RwLock<Tree>> {
+        self.current
+            .lock()
+            .expect("scanner lock poisoned")
+            .tree
+            .clone()
+    }
+
+    pub fn root_id(&self) -> Option<NodeId> {
+        self.tree_handle().read().root
     }
 }
 
@@ -216,478 +239,552 @@ impl Default for Scanner {
     }
 }
 
-/// Shared, clonable scan context handed to every worker.
-#[derive(Clone)]
-struct ScanCtx {
-    tree: Arc<RwLock<Tree>>,
-    inodes: Arc<ShardedInodeSet>,
-    sem: Arc<Semaphore>,
-    tx: Sender<ScanEvent>,
-    cancel: Arc<AtomicBool>,
+impl Drop for Scanner {
+    fn drop(&mut self) {
+        if let Ok(current) = self.current.lock() {
+            if let Some(session) = &current.session {
+                session.cancel();
+            }
+        }
+    }
 }
 
-/// Enumerate one directory's direct children and insert them into the tree.
-/// Idempotent: a no-op if the directory is already `Scanned` or `Scanning`.
-/// Returns the `(child_dir_id, child_dir_path)` pairs that were found, in
-/// addition to emitting progress events.
-fn enumerate_dir(ctx: &ScanCtx, dir_id: NodeId, dir_path: &Path) {
-    if ctx.cancel.load(Ordering::Relaxed) {
-        return;
+#[derive(Clone)]
+struct Job {
+    id: NodeId,
+    path: PathBuf,
+    priority_depth: u8,
+}
+
+struct QueueState {
+    jobs: HashMap<NodeId, Job>,
+    running: HashMap<NodeId, u8>,
+    urgent: VecDeque<NodeId>,
+    background: VecDeque<NodeId>,
+    pending: usize,
+    background_running: usize,
+    closed: bool,
+}
+
+struct JobLease {
+    job: Job,
+    background: bool,
+}
+
+struct Session {
+    root: NodeId,
+    tree: Arc<RwLock<Tree>>,
+    inodes: ShardedInodeSet,
+    queue: Mutex<QueueState>,
+    wake: Condvar,
+    cancelled: AtomicBool,
+    events: Sender<ScanEvent>,
+    dirs_scanned: AtomicU64,
+    items_seen: AtomicU64,
+    errors: AtomicU64,
+    started: Instant,
+    workers: usize,
+    preferred_path: Mutex<Option<PathBuf>>,
+}
+
+impl Session {
+    fn new(
+        root: NodeId,
+        tree: Arc<RwLock<Tree>>,
+        events: Sender<ScanEvent>,
+        workers: usize,
+    ) -> Self {
+        Self {
+            root,
+            tree,
+            inodes: ShardedInodeSet::new(),
+            queue: Mutex::new(QueueState {
+                jobs: HashMap::new(),
+                running: HashMap::new(),
+                urgent: VecDeque::new(),
+                background: VecDeque::new(),
+                pending: 0,
+                background_running: 0,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            events,
+            dirs_scanned: AtomicU64::new(0),
+            items_seen: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            started: Instant::now(),
+            workers,
+            preferred_path: Mutex::new(None),
+        }
     }
 
-    // Guard: only enumerate unscanned dirs; mark as scanning.
+    fn enqueue(&self, job: Job) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut queue = self.queue.lock().expect("queue lock poisoned");
+        if queue.closed {
+            return;
+        }
+        if let Some(priority) = queue.running.get_mut(&job.id) {
+            *priority = (*priority).max(job.priority_depth);
+            return;
+        }
+        if let Some(existing) = queue.jobs.get_mut(&job.id) {
+            if job.priority_depth > existing.priority_depth {
+                existing.priority_depth = job.priority_depth;
+                existing.path = job.path;
+                queue.urgent.push_back(job.id);
+                self.wake.notify_one();
+            }
+            return;
+        }
+        let urgent = job.priority_depth > 0;
+        let id = job.id;
+        queue.jobs.insert(id, job);
+        if urgent {
+            queue.urgent.push_back(id);
+        } else {
+            queue.background.push_back(id);
+        }
+        queue.pending += 1;
+        self.wake.notify_one();
+    }
+
+    fn next_job(&self) -> Option<JobLease> {
+        let mut queue = self.queue.lock().expect("queue lock poisoned");
+        loop {
+            if queue.closed || self.cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            while let Some(id) = queue.urgent.pop_front() {
+                if let Some(job) = queue.jobs.remove(&id) {
+                    queue.running.insert(id, job.priority_depth);
+                    return Some(JobLease {
+                        job,
+                        background: false,
+                    });
+                }
+            }
+            if queue.background_running < self.workers.min(MAX_BACKGROUND_WORKERS) {
+                while let Some(id) = queue.background.pop_front() {
+                    if let Some(job) = queue.jobs.remove(&id) {
+                        queue.background_running += 1;
+                        queue.running.insert(id, job.priority_depth);
+                        return Some(JobLease {
+                            job,
+                            background: true,
+                        });
+                    }
+                }
+            }
+            queue = self.wake.wait(queue).expect("queue lock poisoned");
+        }
+    }
+
+    fn running_priority(&self, id: NodeId) -> u8 {
+        self.queue
+            .lock()
+            .expect("queue lock poisoned")
+            .running
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn finish_job(&self, id: NodeId, background: bool) -> bool {
+        let mut queue = self.queue.lock().expect("queue lock poisoned");
+        queue.running.remove(&id);
+        if background {
+            queue.background_running = queue.background_running.saturating_sub(1);
+        }
+        if queue.pending > 0 {
+            queue.pending -= 1;
+        }
+        if queue.pending == 0 && !self.cancelled.load(Ordering::Acquire) {
+            queue.closed = true;
+            self.wake.notify_all();
+            true
+        } else {
+            self.wake.notify_all();
+            false
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut queue = self.queue.lock().expect("queue lock poisoned");
+        queue.closed = true;
+        queue.jobs.clear();
+        queue.running.clear();
+        queue.urgent.clear();
+        queue.background.clear();
+        self.wake.notify_all();
+    }
+
+    fn prefer(&self, path: PathBuf) {
+        *self
+            .preferred_path
+            .lock()
+            .expect("preferred path lock poisoned") = Some(path);
+    }
+
+    fn priority_for_path(&self, path: &Path) -> u8 {
+        if self
+            .preferred_path
+            .lock()
+            .expect("preferred path lock poisoned")
+            .as_ref()
+            .is_some_and(|preferred| preferred.starts_with(path))
+        {
+            INITIAL_VISIBLE_DEPTH
+        } else {
+            0
+        }
+    }
+
+    fn emit_progress(&self, force: bool) {
+        let dirs = self.dirs_scanned.load(Ordering::Relaxed);
+        if force || dirs.is_multiple_of(PROGRESS_EVERY_DIRS) {
+            let _ = self.events.try_send(ScanEvent::Progress {
+                dirs_scanned: dirs,
+                items_seen: self.items_seen.load(Ordering::Relaxed),
+                errors: self.errors.load(Ordering::Relaxed),
+            });
+        }
+    }
+}
+
+fn available_workers() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .clamp(1, MAX_WORKERS)
+}
+
+fn worker_loop(session: Arc<Session>) {
+    while let Some(lease) = session.next_job() {
+        let job = lease.job;
+        if session.cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        let children = enumerate_directory(&session, &job);
+        let next_priority = session
+            .running_priority(job.id)
+            .max(job.priority_depth)
+            .saturating_sub(1);
+        for (id, path) in children {
+            session.enqueue(Job {
+                id,
+                priority_depth: next_priority.max(session.priority_for_path(&path)),
+                path,
+            });
+        }
+
+        if session.finish_job(job.id, lease.background) {
+            session.emit_progress(true);
+            let complete = session.tree.read().is_complete();
+            let summary = ScanSummary {
+                dirs_scanned: session.dirs_scanned.load(Ordering::Relaxed),
+                items_seen: session.items_seen.load(Ordering::Relaxed),
+                errors: session.errors.load(Ordering::Relaxed),
+                elapsed: session.started.elapsed(),
+                complete,
+                workers: session.workers,
+            };
+            let _ = session.events.send_blocking(ScanEvent::ScanFinished {
+                root: session.root,
+                summary,
+            });
+            break;
+        }
+    }
+}
+
+fn enumerate_directory(session: &Session, job: &Job) -> Vec<(NodeId, PathBuf)> {
     {
-        let mut tree = ctx.tree.write();
-        let Some(node) = tree.get_mut(dir_id) else {
-            return;
+        let mut tree = session.tree.write();
+        let Some(node) = tree.get_mut(job.id) else {
+            return Vec::new();
         };
-        if matches!(node.state, ScanState::Scanned { .. } | ScanState::Scanning { .. }) {
-            return;
+        if !matches!(node.state, ScanState::Unscanned) {
+            return Vec::new();
         }
         node.state = ScanState::Scanning { child_count: 0 };
     }
 
-    // Bound concurrency: hold one permit for the duration of enumeration.
-    let _permit = ctx.sem.acquire();
-
-    let dev = device_of(dir_path).unwrap_or(0);
-    let entries = match list_dir(dir_path) {
-        Ok(e) => e,
-        Err(err) => {
-            log::debug!("enumerate_dir {:?} failed: {err}", dir_path);
-            let mut tree = ctx.tree.write();
-            if let Some(node) = tree.get_mut(dir_id) {
+    let entries = match list_dir(&job.path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::debug!("scan {:?} failed: {error}", job.path);
+            session.errors.fetch_add(1, Ordering::Relaxed);
+            let mut tree = session.tree.write();
+            if let Some(node) = tree.get_mut(job.id) {
                 node.state = ScanState::Error;
             }
-            let _ = ctx.tx.try_send(ScanEvent::DirError { id: dir_id });
-            return;
+            session.emit_progress(true);
+            return Vec::new();
         }
     };
 
-    let mut items_total: u64 = 0;
-    let child_count;
+    let item_count = entries.len() as u64;
+    let mut child_directories = Vec::new();
     {
-        let mut tree = ctx.tree.write();
-        for entry in &entries {
-            items_total += 1;
-            let kind = entry.kind;
-            // Hardlink dedup: count a file's size only the first time we see
-            // its (dev, inode). Directories always count.
-            let counted = if kind.is_dir() {
-                true
-            } else {
-                ctx.inodes.insert(dev, entry.inode)
-            };
-            let size = if counted { entry.size } else { 0 };
-            let block_size = if counted { entry.alloc_size } else { 0 };
-
+        let mut tree = session.tree.write();
+        for entry in entries {
+            let counts = entry.kind != Kind::File
+                || entry.link_count <= 1
+                || entry.dev == 0
+                || entry.inode == 0
+                || session.inodes.insert(entry.dev, entry.inode);
+            let apparent = if counts { entry.size } else { 0 };
+            let allocated = if counts { entry.alloc_size } else { 0 };
+            let is_dir = entry.kind.is_dir();
+            let name = arc_os(entry.name.clone());
             let child = Node {
                 id: 0,
-                parent: Some(dir_id),
-                name: entry.name.clone(),
-                kind,
-                size,
-                block_size,
+                parent: Some(job.id),
+                name,
+                kind: entry.kind,
+                size: apparent,
+                block_size: allocated,
                 mtime: entry.mtime,
                 inode: entry.inode,
-                dev,
-                state: if kind.is_dir() {
+                dev: entry.dev,
+                state: if is_dir {
                     ScanState::Unscanned
                 } else {
                     ScanState::Scanned { child_count: 0 }
                 },
+                complete: !is_dir,
                 children: Vec::new(),
             };
-            let cid = tree.alloc(child);
-            tree.get_mut(dir_id)
-                .expect("dir exists")
+            let child_id = tree.alloc(child);
+            tree.get_mut(job.id)
+                .expect("enumerated directory exists")
                 .children
-                .push(cid);
+                .push(child_id);
+            if is_dir {
+                child_directories.push((child_id, job.path.join(entry.name)));
+            }
         }
-        let node = tree.get_mut(dir_id).expect("dir exists");
-        child_count = node.children.len() as u32;
-        node.state = ScanState::Scanned { child_count };
-        if let Some(meta) = dir_meta(dir_path) {
-            node.mtime = meta.mtime;
-            node.inode = meta.inode;
-            node.dev = meta.dev;
+        if let Some(metadata) = dir_metadata(&job.path) {
+            let node = tree.get_mut(job.id).expect("enumerated directory exists");
+            node.mtime = metadata.mtime;
+            node.inode = metadata.inode;
+            node.dev = metadata.dev;
         }
-        tree.recompute_upward(dir_id);
-    }
-
-    let _ = ctx
-        .tx
-        .try_send(ScanEvent::DirCompleted { id: dir_id, child_count });
-    let _ = ctx
-        .tx
-        .try_send(ScanEvent::Progress { dirs_scanned: 1, items_total });
-}
-
-/// Walk a subtree: enumerate `dir_id` (if needed), then recurse into every
-/// still-unscanned child directory in parallel via scoped threads.
-fn walk_subtree(ctx: &ScanCtx, dir_id: NodeId, dir_path: PathBuf) {
-    if ctx.cancel.load(Ordering::Relaxed) {
-        return;
-    }
-
-    // Make sure this directory's direct children are enumerated.
-    enumerate_dir(ctx, dir_id, &dir_path);
-
-    // Collect the child directories that still need descending into.
-    let child_dirs: Vec<(NodeId, PathBuf)> = {
-        let tree = ctx.tree.read();
-        let Some(node) = tree.get(dir_id) else {
-            return;
-        };
-        node.children
-            .iter()
-            .filter_map(|&c| {
-                let n = tree.get(c)?;
-                // Only descend into dirs we haven't walked yet.
-                if n.kind.is_dir() && matches!(n.state, ScanState::Unscanned) {
-                    Some((c, dir_path.join(n.name.as_ref())))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    if child_dirs.is_empty() {
-        return;
-    }
-
-    std::thread::scope(|s| {
-        for (cid, cpath) in child_dirs {
-            let ctx = ctx.clone();
-            s.spawn(move || walk_subtree(&ctx, cid, cpath));
-        }
-    });
-}
-
-/// Reconstruct a node's absolute path by walking parents.
-fn path_of(tree: &Tree, node: &Node) -> PathBuf {
-    let mut comps: Vec<Arc<str>> = Vec::new();
-    let mut cursor = Some(node);
-    while let Some(cur) = cursor {
-        comps.push(cur.name.clone());
-        cursor = cur.parent.and_then(|p| tree.get(p));
-    }
-    let mut path = PathBuf::new();
-    for name in comps.into_iter().rev() {
-        path.push(name.as_ref());
-    }
-    path
-}
-
-// ---------------------------------------------------------------------------
-// Counting semaphore (blocking, OS-thread safe).
-// ---------------------------------------------------------------------------
-
-/// A blocking counting semaphore bounding concurrent work. Uses the std mutex
-/// + condvar pair so the condvar and mutex are compatible.
-struct Semaphore {
-    state: std::sync::Mutex<usize>,
-    cvar: std::sync::Condvar,
-}
-
-struct PermitGuard<'a> {
-    sem: &'a Semaphore,
-}
-
-impl Drop for PermitGuard<'_> {
-    fn drop(&mut self) {
-        self.sem.release();
-    }
-}
-
-impl Semaphore {
-    fn new(count: usize) -> Self {
-        Self {
-            state: std::sync::Mutex::new(count),
-            cvar: std::sync::Condvar::new(),
+        let child_count = tree
+            .get(job.id)
+            .map_or(0, |node| node.children.len() as u32);
+        tree.get_mut(job.id)
+            .expect("enumerated directory exists")
+            .state = ScanState::Scanned { child_count };
+        tree.recompute_upward(job.id);
+        if child_directories.is_empty() {
+            tree.mark_complete_upward(job.id);
         }
     }
 
-    /// Block until a permit is available, then return a guard that releases it
-    /// on drop.
-    fn acquire(&self) -> PermitGuard<'_> {
-        let mut count = self.state.lock().unwrap();
-        while *count == 0 {
-            count = self.cvar.wait(count).unwrap();
-        }
-        *count -= 1;
-        PermitGuard { sem: self }
+    session.items_seen.fetch_add(item_count, Ordering::Relaxed);
+    let dirs = session.dirs_scanned.fetch_add(1, Ordering::Relaxed) + 1;
+    if job.id == session.root {
+        let _ = session
+            .events
+            .try_send(ScanEvent::VisibleReady { root: session.root });
     }
-
-    fn release(&self) {
-        let mut count = self.state.lock().unwrap();
-        *count += 1;
-        self.cvar.notify_one();
-    }
+    session.emit_progress(dirs == 1);
+    child_directories
 }
 
-// ---------------------------------------------------------------------------
-// Platform directory enumeration.
-// ---------------------------------------------------------------------------
-
-/// A normalized entry returned by both the fast macOS path and the fallback.
-struct RawEntry {
-    name: Arc<str>,
-    kind: Kind,
-    size: u64,
-    alloc_size: u64,
-    mtime: u64,
-    inode: u64,
+pub(crate) struct RawEntry {
+    pub(crate) name: OsString,
+    pub(crate) kind: Kind,
+    pub(crate) size: u64,
+    pub(crate) alloc_size: u64,
+    pub(crate) mtime: i64,
+    pub(crate) inode: u64,
+    pub(crate) dev: u64,
+    pub(crate) link_count: u32,
 }
 
-struct DirMeta {
-    mtime: u64,
+struct DirMetadata {
+    mtime: i64,
     inode: u64,
     dev: u64,
 }
 
 #[cfg(target_os = "macos")]
-mod imp {
-    use super::*;
-    use getattrlistbulk::{ObjectType, RequestedAttributes};
-    use std::time::SystemTime;
-
-    pub fn list_dir(dir: &Path) -> std::io::Result<Vec<RawEntry>> {
-        let attrs = RequestedAttributes {
-            name: true,
-            object_type: true,
-            size: true,
-            alloc_size: true,
-            modified_time: true,
-            inode: true,
-            ..Default::default()
-        };
-        let reader = getattrlistbulk::read_dir_with_buffer(dir, attrs, 128 * 1024)
-            .map_err(io_from_attr_error)?;
-        let mut out = Vec::new();
-        for entry in reader {
-            let entry = entry.map_err(io_from_attr_error)?;
-            out.push(RawEntry {
-                name: entry.name.into(),
-                kind: kind_of(entry.object_type),
-                size: entry.size.unwrap_or(0),
-                alloc_size: entry.alloc_size.unwrap_or_else(|| entry.size.unwrap_or(0)),
-                mtime: entry
-                    .modified_time
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                inode: entry.inode.unwrap_or(0),
-            });
+fn list_dir(path: &Path) -> io::Result<Vec<RawEntry>> {
+    match crate::macos_bulk::read_dir(path) {
+        Ok(entries) => Ok(entries),
+        Err(error) if should_fallback(&error) => {
+            log::debug!("bulk enumeration unavailable for {:?}: {error}", path);
+            list_dir_portable(path)
         }
-        Ok(out)
+        Err(error) => Err(error),
     }
+}
 
-    fn kind_of(t: Option<ObjectType>) -> Kind {
-        match t {
-            Some(ObjectType::Directory) => Kind::Dir,
-            Some(ObjectType::Regular) => Kind::File,
-            Some(ObjectType::Symlink) => Kind::Symlink,
-            _ => Kind::Other,
-        }
-    }
-
-    fn io_from_attr_error(e: getattrlistbulk::Error) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("getattrlistbulk: {e}"))
-    }
+#[cfg(target_os = "macos")]
+fn should_fallback(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| matches!(code, libc::ENOTSUP | libc::EINVAL | libc::ENOSYS))
+        || matches!(
+            error.kind(),
+            io::ErrorKind::Unsupported | io::ErrorKind::InvalidData
+        )
 }
 
 #[cfg(not(target_os = "macos"))]
-mod imp {
-    use super::*;
+fn list_dir(path: &Path) -> io::Result<Vec<RawEntry>> {
+    list_dir_portable(path)
+}
 
-    pub fn list_dir(dir: &Path) -> std::io::Result<Vec<RawEntry>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            use std::os::unix::fs::MetadataExt;
-            let kind = if meta.file_type().is_dir() {
-                Kind::Dir
-            } else if meta.file_type().is_symlink() {
-                Kind::Symlink
-            } else if meta.file_type().is_file() {
-                Kind::File
-            } else {
-                Kind::Other
-            };
-            out.push(RawEntry {
-                name: entry.file_name().to_string_lossy().into(),
-                kind,
-                size: meta.len(),
-                alloc_size: meta.blocks() * 512,
-                mtime: meta.mtime() as u64,
-                inode: meta.ino(),
-            });
-        }
-        Ok(out)
+fn list_dir_portable(path: &Path) -> io::Result<Vec<RawEntry>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_dir() {
+            Kind::Dir
+        } else if file_type.is_file() {
+            Kind::File
+        } else if file_type.is_symlink() {
+            Kind::Symlink
+        } else {
+            Kind::Other
+        };
+        entries.push(RawEntry {
+            name: entry.file_name(),
+            kind,
+            size: metadata.len(),
+            alloc_size: metadata.blocks().saturating_mul(512),
+            mtime: metadata.mtime(),
+            inode: metadata.ino(),
+            dev: metadata.dev(),
+            link_count: metadata.nlink().min(u32::MAX as u64) as u32,
+        });
     }
+    Ok(entries)
 }
 
-/// List the direct children of `dir` using the fastest available path.
-fn list_dir(dir: &Path) -> std::io::Result<Vec<RawEntry>> {
-    imp::list_dir(dir)
-}
-
-/// Stat the directory itself for mtime/inode/dev (used for cache invalidation).
-fn dir_meta(dir: &Path) -> Option<DirMeta> {
+fn dir_metadata(path: &Path) -> Option<DirMetadata> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(dir).ok()?;
-    Some(DirMeta {
-        mtime: meta.mtime() as u64,
-        inode: meta.ino(),
-        dev: meta.dev(),
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    Some(DirMetadata {
+        mtime: metadata.mtime(),
+        inode: metadata.ino(),
+        dev: metadata.dev(),
     })
-}
-
-/// Device id of a path (for hardlink keying).
-fn device_of(dir: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(std::fs::symlink_metadata(dir).ok()?.dev())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
-    /// Build a small fixture tree under a temp dir and return its path. Each
-    /// call gets a unique directory so concurrent tests don't collide.
-    fn fixture() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "daggy-test-{}-{}-{}",
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "daggy-scan-{label}-{}-{}",
             std::process::id(),
-            n,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        fs::create_dir_all(dir.join("a/b")).unwrap();
-        fs::create_dir_all(dir.join("c")).unwrap();
-        fs::write(dir.join("root.txt"), vec![0u8; 1024]).unwrap();
-        fs::write(dir.join("a/f1.bin"), vec![0u8; 2048]).unwrap();
-        fs::write(dir.join("a/b/f2.bin"), vec![0u8; 4096]).unwrap();
-        dir
+            NEXT_GENERATION.load(Ordering::Relaxed)
+        ))
     }
 
-    /// Drain `events` until a `ScanFinished` arrives (or channel closes).
-    fn drain_until_finished(handle: &ScannerHandle) {
-        while let Ok(ev) = handle.events.recv_blocking() {
-            if matches!(ev, ScanEvent::ScanFinished { .. }) {
-                break;
+    fn wait(scanner: &Scanner, path: &Path) -> ScanSummary {
+        let handle = scanner.scan_root(path.to_path_buf());
+        while let Ok(event) = handle.events.recv_blocking() {
+            if let ScanEvent::ScanFinished { summary, .. } = event {
+                return summary;
             }
         }
+        panic!("scan channel closed before completion")
     }
 
     #[test]
-    fn scans_root_and_sums_sizes() {
-        let dir = fixture();
+    fn full_background_scan_produces_exact_complete_tree() {
+        let root = temp_root("complete");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("one"), vec![1; 2000]).unwrap();
+        std::fs::write(root.join("a/two"), vec![2; 3000]).unwrap();
+        std::fs::write(root.join("a/b/three"), vec![3; 4000]).unwrap();
+
         let scanner = Scanner::new();
-        let handle = scanner.scan_root(dir.clone());
-        drain_until_finished(&handle);
-
-        let snap = scanner.snapshot();
-        let root = snap.root().expect("root exists");
-        // Phase 1 scans root + one level (a, c), non-recursively. So:
-        //   root.txt (1024) + a/f1.bin (2048) = 3072
-        // The deeper a/b/f2.bin (4096) is NOT scanned yet (lazy).
-        assert_eq!(
-            root.size,
-            1024 + 2048,
-            "phase-1 root size sums scanned files only"
-        );
-
-        // Expanding "a" descends into "b", adding f2.bin (4096). After that the
-        // root total grows to 3072 + 4096 = 7168.
-        let a_id = {
-            let snap = scanner.snapshot();
-            let mut id = None;
-            for n in snap.children(snap.root.unwrap()) {
-                if n.name.as_ref() == "a" {
-                    id = Some(n.id);
-                    break;
-                }
-            }
-            id.expect("dir a exists")
-        };
-        // Expand "a": this walks the whole subtree (a → b → f2.bin). The worker
-        // drops its sender when done, closing the channel.
-        let h2 = scanner.expand(a_id);
-        while h2.events.recv_blocking().is_ok() {}
-        let root_after = scanner.snapshot().root().expect("root exists").size;
-        assert_eq!(root_after, 1024 + 2048 + 4096, "root size after full expand");
-        let _ = fs::remove_dir_all(&dir);
+        let summary = wait(&scanner, &root);
+        let tree = scanner.tree_handle();
+        let tree = tree.read();
+        assert!(summary.complete);
+        assert_eq!(summary.errors, 0);
+        assert!(summary.workers <= MAX_WORKERS);
+        assert_eq!(summary.items_seen, 5);
+        assert!(tree.is_complete());
+        assert_eq!(tree.len(), 6);
+        assert!(tree.root().unwrap().size >= 9000);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn expand_descends_lazily() {
-        let dir = fixture();
+    fn symlinked_directory_is_not_descended_into() {
+        let root = temp_root("symlink");
+        let outside = temp_root("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("large"), vec![1; 8192]).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let scanner = Scanner::new();
-        let handle = scanner.scan_root(dir.clone());
-        drain_until_finished(&handle);
+        let summary = wait(&scanner, &root);
+        assert_eq!(summary.dirs_scanned, 1);
+        assert_eq!(scanner.tree_handle().read().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
 
-        // After phase 1, "a" is scanned but its grandchild "a/b" should be
-        // Unscanned (we only descended two levels: root + a/c).
-        let a_id = {
-            let snap = scanner.snapshot();
-            let mut id = None;
-            for n in snap.children(snap.root.unwrap()) {
-                if n.name.as_ref() == "a" {
-                    id = Some(n.id);
-                    break;
-                }
-            }
-            id.expect("dir a exists")
-        };
-        assert!(
-            matches!(scanner.snapshot().get(a_id).unwrap().state, ScanState::Scanned { .. }),
-            "dir a scanned in phase 1"
-        );
+    #[test]
+    fn hardlinks_contribute_allocated_bytes_once() {
+        let root = temp_root("hardlink");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("first"), vec![7; 4096]).unwrap();
+        std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
+        let scanner = Scanner::new();
+        let summary = wait(&scanner, &root);
+        let tree = scanner.tree_handle();
+        let tree = tree.read();
+        assert!(summary.complete);
+        assert_eq!(summary.items_seen, 2);
+        assert_eq!(tree.root().unwrap().size, 4096);
+        assert_eq!(tree.root().unwrap().block_size, 4096);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
-        // Expanding "a" walks into "b", which should now be scanned and
-        // contain f2.bin (4096 bytes).
-        let h2 = scanner.expand(a_id);
-        while let Ok(ev) = h2.events.recv_blocking() {
-            // expand descends the whole subtree; break once "a" itself reports
-            // done.
-            if let ScanEvent::DirCompleted { id, .. } = &ev {
-                if *id == a_id {
-                    break;
-                }
-            }
+    #[test]
+    fn new_generation_is_isolated_from_cancelled_workers() {
+        let first = temp_root("first");
+        let second = temp_root("second");
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        for index in 0..80 {
+            std::fs::create_dir_all(first.join(format!("{index}/nested"))).unwrap();
         }
-
-        let snap = scanner.snapshot();
-        let b = snap
-            .children(a_id)
-            .find(|n| n.name.as_ref() == "b")
-            .expect("dir b exists");
-        assert!(
-            matches!(b.state, ScanState::Scanned { .. }),
-            "dir b scanned after expand"
-        );
-        assert_eq!(b.size, 4096, "b sums f2.bin");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cancel_stops_descent() {
-        let dir = fixture();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("only"), b"ok").unwrap();
         let scanner = Scanner::new();
-        let handle = scanner.scan_root(dir.clone());
-        handle.cancel();
-        // Drain whatever was emitted; must not hang.
-        while handle.events.recv_blocking().is_ok() {}
-        let _ = fs::remove_dir_all(&dir);
+        let _old = scanner.scan_root(first.clone());
+        let summary = wait(&scanner, &second);
+        assert!(summary.complete);
+        let tree = scanner.tree_handle();
+        let tree = tree.read();
+        assert_eq!(tree.root().unwrap().name.as_ref(), second.as_os_str());
+        assert_eq!(tree.len(), 2);
+        std::fs::remove_dir_all(first).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
     }
 }

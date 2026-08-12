@@ -1,4 +1,4 @@
 /target
+/.zcode
 **/*.rs.bk
-Cargo.lock
 .DS_Store

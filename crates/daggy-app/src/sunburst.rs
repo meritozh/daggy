@@ -1,246 +1,219 @@
-//! The sunburst visualization: concentric ring wedges, DaisyDisk-style.
-//!
-//! The focused node sits at the center. Its children form the first ring, their
-//! children the second, and so on, up to [`MAX_RINGS`] levels deep. Each ring
-//! is split into angular wedges proportional to size. Wedges are drawn as fill
-//! paths via the low-level canvas/paint API; colors are graded by size.
+//! Three-ring interactive allocation map.
 
-use daggy_core::{fmt, TreeSnapshot};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use daggy_core::{fmt, NodeId, TreeProjection};
 use gpui::{
-    canvas, div, px, App, Bounds, IntoElement, ParentElement, PathBuilder, Pixels, Point,
-    SharedString, Styled, Window,
+    canvas, div, px, App, Bounds, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, PathBuilder, Pixels, Point, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 
-/// How many concentric rings to draw around the focused node.
-const MAX_RINGS: usize = 4;
+use crate::app_state::AppState;
 
-/// A hue from the Catppuccin Mocha palette, picked by a size bucket so bigger
-/// wedges read as warmer/darker.
-fn wedge_color(depth: usize, index: usize) -> u32 {
-    const PALETTE: [u32; 8] = [
-        0xf38ba8, // red
-        0xfab387, // peach
-        0xf9e2af, // yellow
-        0xa6e3a1, // green
-        0x94e2d5, // teal
-        0x89b4fa, // blue
-        0xb4befe, // lavender
-        0xf5c2e7, // pink
-    ];
-    PALETTE[(index + depth) % PALETTE.len()]
-}
+const RINGS: usize = 3;
+const INNER_RADIUS: f32 = 0.28;
+const MIN_ANGLE: f32 = 0.7_f32.to_radians();
+const CANVAS: u32 = 0x0D0F12;
+const TEXT: u32 = 0xE7E9EC;
+const SECONDARY: u32 = 0x9299A3;
+const MUTED: u32 = 0x626A75;
+const PALETTE: [u32; 7] = [
+    0xE7A65A, 0xBF7659, 0x849B74, 0x6F8DA3, 0xA58666, 0xB49A58, 0x777E89,
+];
 
-/// A precomputed wedge to draw. `inner`/`outer` are normalized radii in [0,1]
-/// until paint, where they're scaled to pixels.
 #[derive(Clone)]
 struct Wedge {
-    color: u32,
+    id: Option<NodeId>,
     start: f32,
     end: f32,
     inner: f32,
     outer: f32,
+    color: u32,
 }
 
-/// The sunburst view.
+#[derive(Clone)]
+struct PaintedWedge {
+    start: f32,
+    end: f32,
+    inner: Pixels,
+    outer: Pixels,
+    color: u32,
+}
+
 pub struct Sunburst {
-    /// Cached wedges for the current focus, recomputed on each render from the
-    /// snapshot (cheap — at most a few thousand simple structs).
-    wedges: Vec<Wedge>,
-    center_label: SharedString,
-    center_size: SharedString,
+    bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 }
 
 impl Sunburst {
     pub fn new() -> Self {
         Self {
-            wedges: Vec::new(),
-            center_label: "daggy".into(),
-            center_size: "".into(),
+            bounds: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Recompute wedge geometry for `focus` from the snapshot.
-    fn recompute(&mut self, snap: &TreeSnapshot, focus: u32) {
-        self.wedges.clear();
-        let (label, total) = match snap.get(focus) {
-            Some(n) => (n.name.clone(), n.size),
-            None => return,
-        };
-        self.center_label = SharedString::from(label.to_string());
-        self.center_size = SharedString::from(fmt::human_bytes(total));
-
-        // BFS by depth, assigning angular spans. Each node owns an arc; its
-        // children subdivide that arc proportional to their sizes.
-        let mut queue: Vec<(u32, f32, f32)> = Vec::new(); // (id, start, end)
-        if let Some(node) = snap.get(focus) {
-            // First ring covers the full circle (0..2π).
-            let total_child: u64 =
-                node.children.iter().filter_map(|c| snap.get(*c)).map(|n| n.size).sum();
-            let total = total_child.max(1) as f32;
-            let mut cursor = 0.0_f32;
-            let children: Vec<u32> = node.children.clone();
-            for (i, &c) in children.iter().enumerate() {
-                let span = snap.get(c).map(|n| (n.size as f32 / total) * std::f32::consts::TAU).unwrap_or(0.0);
-                let _ = i;
-                let start = cursor;
-                let end = cursor + span;
-                queue.push((c, start, end));
-                cursor = end;
-            }
-        }
-
-        let mut depth = 0usize;
-        let mut ring_width = 0.0_f32;
-        while !queue.is_empty() && depth < MAX_RINGS {
-            let mut next: Vec<(u32, f32, f32)> = Vec::new();
-            // ring_width is set on the first iteration from the canvas; we use
-            // a placeholder here and scale at paint time via normalized radii.
-            let _ = ring_width;
-            for (idx, (id, start, end)) in queue.drain(..).enumerate() {
-                let color = wedge_color(depth, idx);
-                // Normalized inner/outer radii in [0,1]; scaled to pixels at paint.
-                let inner = depth as f32 / MAX_RINGS as f32;
-                let outer = (depth + 1) as f32 / MAX_RINGS as f32;
-                self.wedges.push(Wedge { color, start, end, inner, outer });
-                // Enqueue this node's children within [start, end].
-                if let Some(node) = snap.get(id) {
-                    let total_child: u64 =
-                        node.children.iter().filter_map(|c| snap.get(*c)).map(|n| n.size).sum();
-                    let total = total_child.max(1) as f32;
-                    let mut cursor = start;
-                    let children: Vec<u32> = node.children.clone();
-                    for &c in &children {
-                        let span = snap.get(c).map(|n| (n.size as f32 / total) * (end - start)).unwrap_or(0.0);
-                        let s = cursor;
-                        let e = cursor + span;
-                        next.push((c, s, e));
-                        cursor = e;
-                    }
-                }
-            }
-            queue = next;
-            depth += 1;
-            ring_width += 0.0;
-        }
-    }
-
-    pub fn render(&mut self, snap: &TreeSnapshot, focus: u32) -> impl IntoElement {
-        self.recompute(snap, focus);
-        let label = self.center_label.clone();
-        let size = self.center_size.clone();
-        let wedges = self.wedges.clone();
-
+    pub fn render(
+        &mut self,
+        projection: &TreeProjection,
+        hovered: Option<NodeId>,
+        selected: Option<NodeId>,
+        center_note: &'static str,
+        state: gpui::WeakEntity<AppState>,
+    ) -> impl IntoElement {
+        let wedges = Arc::new(build_wedges(projection));
+        let highlighted = hovered.or(selected);
+        let bounds_store = self.bounds.clone();
+        let paint_wedges = wedges.clone();
         let painter = canvas(
             move |bounds: Bounds<Pixels>, _window, _cx: &mut App| {
-                // Precompute pixel geometry for the paint closure.
+                if let Ok(mut stored) = bounds_store.lock() {
+                    *stored = Some(bounds);
+                }
                 let center = Point {
                     x: bounds.origin.x + bounds.size.width * 0.5,
                     y: bounds.origin.y + bounds.size.height * 0.5,
                 };
-                let max_radius = bounds.size.width.min(bounds.size.height) * 0.5 * 0.95;
-                // Convert normalized radii to pixels up front.
-                let painted: Vec<PaintedWedge> = wedges
+                let radius = bounds.size.width.min(bounds.size.height) * 0.455;
+                let painted = paint_wedges
                     .iter()
-                    .map(|w| PaintedWedge {
-                        color: w.color,
-                        start: w.start,
-                        end: w.end,
-                        inner: max_radius * w.inner,
-                        outer: max_radius * w.outer,
+                    .map(|wedge| PaintedWedge {
+                        start: wedge.start,
+                        end: wedge.end,
+                        inner: radius * wedge.inner + px(1.2),
+                        outer: radius * wedge.outer - px(1.2),
+                        color: if wedge.id == highlighted {
+                            lighten(wedge.color, 0.18)
+                        } else {
+                            wedge.color
+                        },
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
                 (center, painted)
             },
-            move |_, (center, painted), window, _cx: &mut App| {
-                for wedge in &painted {
-                    paint_wedge(window, center, wedge);
+            move |_, (center, wedges), window, _cx: &mut App| {
+                for wedge in wedges {
+                    paint_wedge(window, center, &wedge);
                 }
             },
         )
         .size_full();
 
-        // Overlay the center label/size on top of the canvas.
+        let focus = projection.focus_node.as_ref();
+        let highlighted_node = highlighted.and_then(|id| {
+            projection
+                .chart_node(id)
+                .map(|chart| &chart.node)
+                .or_else(|| projection.rows.iter().find(|row| row.id == id))
+        });
+        let label = highlighted_node
+            .or(focus)
+            .map(|node| {
+                if node.parent.is_none() {
+                    Path::new(node.name.as_ref())
+                        .file_name()
+                        .unwrap_or(node.name.as_ref())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    node.display_name()
+                }
+            })
+            .unwrap_or_else(|| "daggy".into());
+        let size = highlighted_node
+            .or(focus)
+            .map(|node| fmt::human_bytes(node.block_size))
+            .unwrap_or_else(|| "0 B".into());
+
+        let move_bounds = self.bounds.clone();
+        let move_wedges = wedges.clone();
+        let move_state = state.clone();
+        let hover_state = state.clone();
+        let click_bounds = self.bounds.clone();
+        let click_wedges = wedges;
+        let click_state = state;
+
         div()
+            .id("sunburst-map")
             .relative()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
             .size_full()
-            .bg(gpui::rgb(0x181825))
+            .bg(gpui::rgb(CANVAS))
+            .cursor_pointer()
+            .on_mouse_move(move |event, _, cx| {
+                let id = hit_test(&move_bounds, &move_wedges, event.position).and_then(|hit| hit);
+                let _ = move_state.update(cx, |state, cx| state.set_hovered(id, cx));
+            })
+            .on_hover(move |inside, _, cx| {
+                if !*inside {
+                    let _ = hover_state.update(cx, |state, cx| state.set_hovered(None, cx));
+                }
+            })
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                match hit_test(&click_bounds, &click_wedges, event.position) {
+                    Some(Some(id)) => {
+                        let _ = click_state.update(cx, |state, cx| state.activate_node(id, cx));
+                    }
+                    Some(None) => {
+                        let _ = click_state.update(cx, |state, cx| state.go_up(cx));
+                    }
+                    None => {}
+                }
+            })
             .child(painter)
             .child(
                 div()
                     .absolute()
+                    .inset_0()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .gap_1()
+                    .justify_center()
                     .child(
                         div()
-                            .text_color(gpui::rgb(0xcdd6f4))
-                            .text_lg()
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_color(gpui::rgb(0xa6adc8))
-                            .text_sm()
-                            .child(size),
+                            .w(px(176.))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_center()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(gpui::rgb(TEXT))
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.))
+                                    .font_family("SF Mono")
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(gpui::rgb(TEXT))
+                                    .child(SharedString::from(size)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(4.))
+                                    .text_xs()
+                                    .text_color(gpui::rgb(if center_note == "calculating" {
+                                        0xB98B54
+                                    } else {
+                                        MUTED
+                                    }))
+                                    .child(center_note),
+                            ),
                     ),
             )
-    }
-}
-
-/// A wedge with pixel-space radii, ready to paint.
-struct PaintedWedge {
-    color: u32,
-    start: f32,
-    end: f32,
-    inner: Pixels,
-    outer: Pixels,
-}
-
-/// Draw one ring wedge as a filled annular sector. We approximate the arc with
-/// line segments around the circle.
-fn paint_wedge(window: &mut Window, center: Point<Pixels>, wedge: &PaintedWedge) {
-    if wedge.end <= wedge.start {
-        return;
-    }
-    let steps = ((wedge.end - wedge.start) / std::f32::consts::TAU * 64.0).ceil() as usize;
-    let steps = steps.max(2);
-    let mut path = PathBuilder::fill();
-    // Outer arc, start -> end.
-    for i in 0..=steps {
-        let t = wedge.start + (wedge.end - wedge.start) * (i as f32 / steps as f32);
-        let p = polar(center, wedge.outer, t);
-        if i == 0 {
-            path.move_to(p);
-        } else {
-            path.line_to(p);
-        }
-    }
-    // Inner arc, end -> start (reverse so the sector closes correctly).
-    for i in 0..=steps {
-        let t = wedge.end - (wedge.end - wedge.start) * (i as f32 / steps as f32);
-        let p = polar(center, wedge.inner, t);
-        path.line_to(p);
-    }
-    path.close();
-    if let Ok(built) = path.build() {
-        window.paint_path(built, gpui::rgb(wedge.color));
-    }
-}
-
-/// Convert polar (angle in radians) to a pixel point around `center`.
-fn polar(center: Point<Pixels>, radius: Pixels, angle: f32) -> Point<Pixels> {
-    // Start at 12 o'clock (-π/2) and sweep clockwise. Extract the f32 value by
-    // dividing by 1px (Pixels / Pixels -> f32).
-    let r = radius / px(1.0);
-    let a = angle - std::f32::consts::FRAC_PI_2;
-    Point {
-        x: center.x + px(a.cos() * r),
-        y: center.y + px(a.sin() * r),
+            .child(
+                div()
+                    .absolute()
+                    .left(px(18.))
+                    .bottom(px(16.))
+                    .text_xs()
+                    .text_color(gpui::rgb(SECONDARY))
+                    .child("Click a branch to focus  ·  click the center to go up"),
+            )
     }
 }
 
@@ -248,4 +221,193 @@ impl Default for Sunburst {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn build_wedges(projection: &TreeProjection) -> Vec<Wedge> {
+    let mut wedges = Vec::new();
+    if let Some(focus) = projection.focus {
+        append_children(
+            projection,
+            focus,
+            0.0,
+            std::f32::consts::TAU,
+            0,
+            0,
+            &mut wedges,
+        );
+    }
+    wedges
+}
+
+fn append_children(
+    projection: &TreeProjection,
+    parent: NodeId,
+    start: f32,
+    end: f32,
+    depth: usize,
+    branch_color: usize,
+    wedges: &mut Vec<Wedge>,
+) {
+    if depth >= RINGS {
+        return;
+    }
+    let Some(parent) = projection.chart_node(parent) else {
+        return;
+    };
+    let children = parent
+        .children
+        .iter()
+        .filter_map(|id| {
+            projection
+                .chart_node(*id)
+                .map(|node| (*id, node.node.block_size))
+        })
+        .collect::<Vec<_>>();
+    let total = children
+        .iter()
+        .map(|(_, size)| *size)
+        .sum::<u64>()
+        .saturating_add(parent.omitted_size);
+    if total == 0 {
+        return;
+    }
+
+    let ring_width = (1.0 - INNER_RADIUS) / RINGS as f32;
+    let inner = INNER_RADIUS + ring_width * depth as f32;
+    let outer = inner + ring_width;
+    let mut cursor = start;
+    let mut grouped = parent.omitted_size;
+    for (index, (id, size)) in children.into_iter().enumerate() {
+        let span = (end - start) * size as f32 / total as f32;
+        if span < MIN_ANGLE {
+            grouped = grouped.saturating_add(size);
+            continue;
+        }
+        let color_index = if depth == 0 {
+            index
+        } else {
+            branch_color
+                .wrapping_mul(2)
+                .wrapping_add(index)
+                .wrapping_add(depth)
+        };
+        let wedge_end = cursor + span;
+        wedges.push(Wedge {
+            id: Some(id),
+            start: cursor + 0.0015,
+            end: wedge_end - 0.0015,
+            inner,
+            outer,
+            color: depth_color(PALETTE[color_index % PALETTE.len()], depth),
+        });
+        append_children(
+            projection,
+            id,
+            cursor,
+            wedge_end,
+            depth + 1,
+            color_index,
+            wedges,
+        );
+        cursor = wedge_end;
+    }
+    if grouped > 0 {
+        let span = (end - start) * grouped as f32 / total as f32;
+        wedges.push(Wedge {
+            id: None,
+            start: cursor + 0.0015,
+            end: (cursor + span).min(end) - 0.0015,
+            inner,
+            outer,
+            color: depth_color(0x555D67, depth),
+        });
+    }
+}
+
+fn hit_test(
+    bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+    wedges: &[Wedge],
+    position: Point<Pixels>,
+) -> Option<Option<NodeId>> {
+    let bounds = bounds.lock().ok()?.as_ref().copied()?;
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let center = Point {
+        x: bounds.origin.x + bounds.size.width * 0.5,
+        y: bounds.origin.y + bounds.size.height * 0.5,
+    };
+    let radius = bounds.size.width.min(bounds.size.height) * 0.455;
+    let dx = (position.x - center.x) / px(1.0);
+    let dy = (position.y - center.y) / px(1.0);
+    let normalized_radius = (dx * dx + dy * dy).sqrt() / (radius / px(1.0));
+    if normalized_radius < INNER_RADIUS {
+        return Some(None);
+    }
+    let mut angle = dy.atan2(dx) + std::f32::consts::FRAC_PI_2;
+    if angle < 0.0 {
+        angle += std::f32::consts::TAU;
+    }
+    for wedge in wedges.iter().rev() {
+        if normalized_radius >= wedge.inner
+            && normalized_radius <= wedge.outer
+            && angle >= wedge.start
+            && angle <= wedge.end
+        {
+            return Some(wedge.id);
+        }
+    }
+    None
+}
+
+fn paint_wedge(window: &mut Window, center: Point<Pixels>, wedge: &PaintedWedge) {
+    if wedge.end <= wedge.start || wedge.outer <= wedge.inner {
+        return;
+    }
+    let steps = (((wedge.end - wedge.start) / std::f32::consts::TAU) * 112.0)
+        .ceil()
+        .max(3.0) as usize;
+    let mut path = PathBuilder::fill();
+    for index in 0..=steps {
+        let angle = wedge.start + (wedge.end - wedge.start) * index as f32 / steps as f32;
+        let point = polar(center, wedge.outer, angle);
+        if index == 0 {
+            path.move_to(point);
+        } else {
+            path.line_to(point);
+        }
+    }
+    for index in 0..=steps {
+        let angle = wedge.end - (wedge.end - wedge.start) * index as f32 / steps as f32;
+        path.line_to(polar(center, wedge.inner, angle));
+    }
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, gpui::rgb(wedge.color));
+    }
+}
+
+fn polar(center: Point<Pixels>, radius: Pixels, angle: f32) -> Point<Pixels> {
+    let radius = radius / px(1.0);
+    let angle = angle - std::f32::consts::FRAC_PI_2;
+    Point {
+        x: center.x + px(angle.cos() * radius),
+        y: center.y + px(angle.sin() * radius),
+    }
+}
+
+fn depth_color(color: u32, depth: usize) -> u32 {
+    if depth == 0 {
+        color
+    } else {
+        lighten(color, 0.08 * depth as f32)
+    }
+}
+
+fn lighten(color: u32, amount: f32) -> u32 {
+    let red = ((color >> 16) & 0xff) as f32;
+    let green = ((color >> 8) & 0xff) as f32;
+    let blue = (color & 0xff) as f32;
+    let blend = |channel: f32| (channel + (255.0 - channel) * amount).round() as u32;
+    (blend(red) << 16) | (blend(green) << 8) | blend(blue)
 }

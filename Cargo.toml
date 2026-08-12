@@ -15,11 +15,11 @@ daggy-core = { path = "crates/daggy-core" }
 daggy-cache = { path = "crates/daggy-cache" }
 
 # Shared dependencies. Pinned once at the workspace level so all crates agree.
-gpui = { git = "https://github.com/zed-industries/zed", branch = "main" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "b13f6c7114e5e71f5e2048788fdc59bbfa2539d0" }
 # `font-kit` must be enabled on gpui_platform (it forwards to
 # gpui_macos/font-kit); without it gpui uses a NoopTextSystem and NO text
 # renders — the window appears blank.
-gpui_platform = { git = "https://github.com/zed-industries/zed", branch = "main", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "b13f6c7114e5e71f5e2048788fdc59bbfa2539d0", features = ["font-kit"] }
 smol = "2"
 rustc-hash = "2"
 parking_lot = "0.12"
@@ -27,9 +27,9 @@ dirs = "5"
 memmap2 = "0.9"
 anyhow = "1"
 log = "0.4"
-# macOS fast-path bulk directory enumeration; safe bindings over getattrlistbulk.
-getattrlistbulk = "0.1"
 libc = "0.2"
+blake3 = "1.8"
+rkyv = { version = "0.8", features = ["bytecheck"] }
 
 [profile.release]
 opt-level = 3

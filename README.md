@@ -1,39 +1,77 @@
 # daggy
 
-> Your disk is daggy — let's analyze it.
+Daggy is a local macOS disk-usage analyzer built with a pure Rust application
+stack and GPUI. It presents allocated storage as an interactive three-ring map
+with a size-ranked inspector.
 
-A DaisyDisk-inspired disk usage analyzer for macOS, built in pure Rust with
-[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (Metal-rendered)
-for the UI and a high-performance, low-CPU scanning engine.
+## What it does
 
-## Features
+- Shows the selected folder immediately from a dated last-good snapshot when
+  one exists.
+- Scans the visible layers first, then completes correct full-tree accounting
+  in the background.
+- Promotes a focused branch without spawning new recursive threads.
+- Uses up to four workers for visible work and only two for deep background
+  traversal, keeping sustained CPU and I/O modest.
+- Enumerates macOS directories with an internal `getattrlistbulk(2)` adapter
+  that preserves exact path bytes, does not follow symlinks, validates returned
+  records, and falls back to `std::fs` on unsupported volumes.
+- Counts multiply-linked files once using `(device, inode)` identity.
+- Stores complete scans as validated rkyv archives under
+  `~/Library/Caches/daggy/snapshots-v2`. Failed or partial refreshes never
+  replace the previous good snapshot.
+- Labels cached, calculating, complete, and unreadable states explicitly.
 
-- **Sunburst + list visualization** — drill into your disk layer by layer, the
-  way DaisyDisk does it.
-- **Lazy per-layer scanning** — phase 1 gives you the top levels instantly;
-  subtrees are scanned on demand when you expand them, so the app stays idle
-  and cool.
-- **Fast macOS enumeration** — uses the `getattrlistbulk` syscall (one bulk call
-  returns many entries *and* their metadata), ~6× faster than per-file `stat`.
-- **Low CPU** — a bounded 64-wide semaphore caps concurrent I/O; the app never
-  spawns thousands of threads.
-- **Hardlink-aware** — files with multiple hardlinks are counted once via a
-  sharded inode set (128 shards → near-zero lock contention).
-- **Cached results** — scan trees are persisted to a compact mmap'd binary file
-  in `~/Library/Caches/daggy`, invalidated per-subtree by directory mtime.
-
-## Crates
+## Workspace
 
 | Crate | Responsibility |
-|-------|----------------|
-| [`daggy-core`](crates/daggy-core) | Scanning engine + arena tree model (no UI deps). |
-| [`daggy-cache`](crates/daggy-cache) | mmap'd binary cache, mtime invalidation. |
-| [`daggy-app`](crates/daggy-app) | GPUI application binary. |
+|---|---|
+| `daggy-core` | Bounded scan coordinator, macOS enumeration, arena tree, compact UI projections |
+| `daggy-cache` | Versioned rkyv archive, mmap validation, atomic last-good replacement |
+| `daggy-app` | GPUI state, interactive sunburst, ranked inspector, keyboard navigation |
 
-## Build
+GPUI is pinned to commit `b13f6c7114e5e71f5e2048788fdc59bbfa2539d0`
+because its API is still pre-1.0.
+
+## Build and test
+
+Install Apple's Metal compiler component once:
 
 ```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+Then run:
+
+```sh
+cargo test --workspace
 cargo run -p daggy-app
 ```
 
-Requires the Metal toolchain (Xcode): `xcodebuild -downloadComponent MetalToolchain`.
+Create the local application bundle:
+
+```sh
+cargo build --release -p daggy-app
+./scripts/make-bundle.sh
+open target/release/daggy.app
+```
+
+Benchmark a full traversal, optionally selecting one to four workers:
+
+```sh
+cargo run --release -p daggy-core --example scan_perf -- . 4
+```
+
+On the development tree measured on 2026-08-13, a warm complete traversal of
+about 29,500 entries took roughly 57 ms with two workers. Treat that as a local
+regression baseline, not a universal claim.
+
+## Controls
+
+- Click a branch or ranked folder to focus it.
+- Click the center or press Escape to go up.
+- Use Up and Down to select a row, then Return to open it.
+- Press Command-O to choose another folder.
+
+The first launch starts with an empty state. Later launches restore the most
+recent complete snapshot and refresh it in the background.

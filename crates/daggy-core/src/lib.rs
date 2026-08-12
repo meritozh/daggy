@@ -3,13 +3,16 @@
 //! This crate has no UI dependencies, so it can be unit-tested headlessly and
 //! reused by any frontend.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod fmt;
 mod inode_set;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_bulk;
 mod scanner;
 mod tree;
 
 pub use inode_set::ShardedInodeSet;
-pub use scanner::{ScanEvent, Scanner, ScannerHandle};
-pub use tree::{Kind, Node, NodeId, ScanState, Tree, TreeSnapshot};
+pub use scanner::{ScanEvent, ScanSummary, Scanner, ScannerHandle};
+pub use tree::{ChartNode, Kind, Node, NodeId, NodeView, ScanState, Tree, TreeProjection};
