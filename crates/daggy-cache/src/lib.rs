@@ -448,6 +448,35 @@ mod tests {
     }
 
     #[test]
+    fn live_scan_saves_and_reloads_through_shipped_api() {
+        use daggy_core::{ScanEvent, Scanner};
+        let root = temp_path("live-scan");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("a.bin"), vec![1; 2048]).unwrap();
+        fs::write(root.join("nested/b.bin"), vec![2; 4096]).unwrap();
+        let scanner = Scanner::new();
+        let handle = scanner.scan_root(root.clone());
+        while let Ok(event) = handle.events.recv_blocking() {
+            if matches!(event, ScanEvent::ScanFinished { .. }) {
+                break;
+            }
+        }
+        let tree = scanner.tree_handle().read().clone();
+        assert!(tree.is_complete());
+        let cache = root.join("snapshot.daggy");
+        save_to_path(&tree, &root, &cache).unwrap();
+        let hit = load_from_path(&root, &cache)
+            .unwrap()
+            .expect("cache should reload");
+        assert_eq!(hit.tree.len(), tree.len());
+        assert_eq!(
+            hit.tree.root().unwrap().block_size,
+            tree.root().unwrap().block_size
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn path_hash_disambiguates_sanitization_collisions() {
         let left = cache_path(Path::new("/a/b_c")).unwrap();
         let right = cache_path(Path::new("/a_b/c")).unwrap();

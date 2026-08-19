@@ -11,17 +11,11 @@ use gpui::{
 };
 
 use crate::app_state::AppState;
+use crate::theme::Theme;
 
 const RINGS: usize = 3;
 const INNER_RADIUS: f32 = 0.28;
 const MIN_ANGLE: f32 = 0.7_f32.to_radians();
-const CANVAS: u32 = 0x0D0F12;
-const TEXT: u32 = 0xE7E9EC;
-const SECONDARY: u32 = 0x9299A3;
-const MUTED: u32 = 0x626A75;
-const PALETTE: [u32; 7] = [
-    0xE7A65A, 0xBF7659, 0x849B74, 0x6F8DA3, 0xA58666, 0xB49A58, 0x777E89,
-];
 
 #[derive(Clone)]
 struct Wedge {
@@ -59,12 +53,14 @@ impl Sunburst {
         hovered: Option<NodeId>,
         selected: Option<NodeId>,
         center_note: &'static str,
+        theme: Theme,
         state: gpui::WeakEntity<AppState>,
     ) -> impl IntoElement {
-        let wedges = Arc::new(build_wedges(projection));
+        let wedges = Arc::new(build_wedges(projection, &theme));
         let highlighted = hovered.or(selected);
         let bounds_store = self.bounds.clone();
         let paint_wedges = wedges.clone();
+        let highlight_amount = if theme.is_dark { 0.18 } else { 0.10 };
         let painter = canvas(
             move |bounds: Bounds<Pixels>, _window, _cx: &mut App| {
                 if let Ok(mut stored) = bounds_store.lock() {
@@ -75,6 +71,7 @@ impl Sunburst {
                     y: bounds.origin.y + bounds.size.height * 0.5,
                 };
                 let radius = bounds.size.width.min(bounds.size.height) * 0.455;
+                let highlight = highlight_amount;
                 let painted = paint_wedges
                     .iter()
                     .map(|wedge| PaintedWedge {
@@ -83,7 +80,7 @@ impl Sunburst {
                         inner: radius * wedge.inner + px(1.2),
                         outer: radius * wedge.outer - px(1.2),
                         color: if wedge.id == highlighted {
-                            lighten(wedge.color, 0.18)
+                            lighten(wedge.color, highlight)
                         } else {
                             wedge.color
                         },
@@ -137,8 +134,8 @@ impl Sunburst {
             .id("sunburst-map")
             .relative()
             .size_full()
-            .bg(gpui::rgb(CANVAS))
-            .cursor_pointer()
+            .bg(theme.canvas)
+            .cursor(gpui::CursorStyle::Arrow)
             .on_mouse_move(move |event, _, cx| {
                 let id = hit_test(&move_bounds, &move_wedges, event.position).and_then(|hit| hit);
                 let _ = move_state.update(cx, |state, cx| state.set_hovered(id, cx));
@@ -178,41 +175,31 @@ impl Sunburst {
                                     .w_full()
                                     .truncate()
                                     .text_center()
-                                    .text_sm()
+                                    .text_size(px(13.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(gpui::rgb(TEXT))
+                                    .text_color(theme.text)
                                     .child(SharedString::from(label)),
                             )
                             .child(
                                 div()
-                                    .mt(px(5.))
-                                    .font_family("SF Mono")
+                                    .mt(px(4.))
                                     .text_size(px(20.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(gpui::rgb(TEXT))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
                                     .child(SharedString::from(size)),
                             )
                             .child(
                                 div()
                                     .mt(px(4.))
                                     .text_xs()
-                                    .text_color(gpui::rgb(if center_note == "calculating" {
-                                        0xB98B54
+                                    .text_color(if center_note == "calculating" {
+                                        theme.warning
                                     } else {
-                                        MUTED
-                                    }))
+                                        theme.text_tertiary
+                                    })
                                     .child(center_note),
                             ),
                     ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(18.))
-                    .bottom(px(16.))
-                    .text_xs()
-                    .text_color(gpui::rgb(SECONDARY))
-                    .child("Click a branch to focus  ·  click the center to go up"),
             )
     }
 }
@@ -223,7 +210,7 @@ impl Default for Sunburst {
     }
 }
 
-fn build_wedges(projection: &TreeProjection) -> Vec<Wedge> {
+fn build_wedges(projection: &TreeProjection, theme: &Theme) -> Vec<Wedge> {
     let mut wedges = Vec::new();
     if let Some(focus) = projection.focus {
         append_children(
@@ -233,6 +220,7 @@ fn build_wedges(projection: &TreeProjection) -> Vec<Wedge> {
             std::f32::consts::TAU,
             0,
             0,
+            theme,
             &mut wedges,
         );
     }
@@ -246,6 +234,7 @@ fn append_children(
     end: f32,
     depth: usize,
     branch_color: usize,
+    theme: &Theme,
     wedges: &mut Vec<Wedge>,
 ) {
     if depth >= RINGS {
@@ -298,7 +287,7 @@ fn append_children(
             end: wedge_end - 0.0015,
             inner,
             outer,
-            color: depth_color(PALETTE[color_index % PALETTE.len()], depth),
+            color: depth_color(theme.sunburst[color_index % theme.sunburst.len()], depth),
         });
         append_children(
             projection,
@@ -307,6 +296,7 @@ fn append_children(
             wedge_end,
             depth + 1,
             color_index,
+            theme,
             wedges,
         );
         cursor = wedge_end;
@@ -319,7 +309,7 @@ fn append_children(
             end: (cursor + span).min(end) - 0.0015,
             inner,
             outer,
-            color: depth_color(0x555D67, depth),
+            color: depth_color(theme.sunburst_grouped, depth),
         });
     }
 }

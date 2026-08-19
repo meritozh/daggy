@@ -278,6 +278,41 @@ impl AppState {
         }
     }
 
+    pub fn can_go_up(&self) -> bool {
+        self.projection()
+            .focus_node
+            .is_some_and(|node| node.parent.is_some())
+    }
+
+    pub fn focused_or_selected_path(&self) -> Option<PathBuf> {
+        let id = self.selected.or(self.focus)?;
+        if let Some(tree) = &self.cached_tree {
+            tree.path_of(id)
+        } else {
+            self.scanner.tree_handle().read().path_of(id)
+        }
+        .or_else(|| self.root_path.clone())
+    }
+
+    pub fn copy_label(&self) -> Option<String> {
+        if let Some(path) = self.focused_or_selected_path() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        self.root_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    pub fn reveal_in_finder(&self) {
+        let Some(path) = self.focused_or_selected_path() else {
+            return;
+        };
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+
     pub fn status_line(&self, projection: &TreeProjection) -> String {
         let allocated = projection.root.as_ref().map_or(0, |root| root.block_size);
         match self.source {
