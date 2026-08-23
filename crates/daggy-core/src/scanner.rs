@@ -522,7 +522,9 @@ fn enumerate_directory(session: &Session, job: &Job) -> Vec<(NodeId, PathBuf)> {
             let mut tree = session.tree.write();
             if let Some(node) = tree.get_mut(job.id) {
                 node.state = ScanState::Error;
+                node.complete = true;
             }
+            tree.mark_complete_upward(job.id);
             session.emit_progress(true);
             return Vec::new();
         }

@@ -1,15 +1,16 @@
-//! Native macOS shell: sidebar locations, unified titlebar, map, inspector.
+//! Pencil shell: unified titlebar, favorites sidebar, map, inspector.
 
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use daggy_core::{fmt, Kind, NodeView, TreeProjection};
+use daggy_core::{fmt, NodeId, NodeView, TreeProjection};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, relative, uniform_list, AnyElement, Context, CursorStyle, Element, Entity, FocusHandle,
-    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
-    Window, WindowControlArea,
+    div, px, relative, uniform_list, AnyElement, Context, CursorStyle, Element, Entity,
+    FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, WindowControlArea,
 };
 
 use crate::app_state::{AppState, DisplaySource};
@@ -19,6 +20,7 @@ use crate::locations::{
 use crate::sf_symbol::{self, Glyph};
 use crate::sunburst::Sunburst;
 use crate::theme::{native_chrome, Theme};
+use crate::volume::{volume_info, VolumeInfo};
 
 pub struct RootView {
     state: Entity<AppState>,
@@ -26,6 +28,9 @@ pub struct RootView {
     theme: Theme,
     focus_handle: FocusHandle,
     list_scroll: UniformListScrollHandle,
+    sidebar_open: bool,
+    filter: Option<String>,
+    filter_matches: RefCell<Option<(Arc<Vec<NodeId>>, String, Arc<Vec<usize>>)>>,
     _appearance: gpui::Subscription,
 }
 
@@ -34,8 +39,10 @@ struct WorkspaceRender<'a> {
     source: DisplaySource,
     hovered: Option<u32>,
     selected: Option<u32>,
-    center_note: &'static str,
-    finished_with_gaps: bool,
+    center_note: SharedString,
+    files: u64,
+    trash: Option<u64>,
+    status: String,
 }
 
 impl RootView {
@@ -61,6 +68,9 @@ impl RootView {
             theme: Theme::from_appearance(window.appearance()),
             focus_handle: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
+            sidebar_open: true,
+            filter: None,
+            filter_matches: RefCell::new(None),
             _appearance: appearance,
         }
     }
@@ -88,7 +98,79 @@ impl RootView {
         .detach();
     }
 
-    fn render_sidebar(&self, root_path: Option<&PathBuf>) -> impl IntoElement {
+    fn render_titlebar(
+        &self,
+        title: SharedString,
+        has_root: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let chrome = native_chrome();
+        drag_strip("titlebar-drag", theme.surface)
+            .h(chrome.titlebar_height)
+            .px(px(16.0))
+            .gap(px(12.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().w(px(52.0)).h(px(12.0)).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(toolbar_button(
+                        "rescan",
+                        Glyph::Refresh,
+                        has_root,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.update(cx, |state, cx| state.rescan(cx));
+                        }),
+                    ))
+                    .child(toolbar_button(
+                        "reveal",
+                        Glyph::Reveal,
+                        has_root,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.read(cx).reveal_in_finder();
+                        }),
+                    ))
+                    .child(toolbar_button(
+                        "search",
+                        Glyph::Search,
+                        has_root,
+                        theme,
+                        cx.listener(|this, _, _, cx| this.toggle_filter(cx)),
+                    ))
+                    .child(toolbar_button(
+                        "sidebar",
+                        Glyph::Sidebar,
+                        true,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = !this.sidebar_open;
+                            cx.notify();
+                        }),
+                    )),
+            )
+    }
+
+    fn render_sidebar(
+        &self,
+        root_path: Option<&PathBuf>,
+        volume: Option<&VolumeInfo>,
+    ) -> impl IntoElement {
         let theme = self.theme;
         let chrome = native_chrome();
         let locations = sidebar_locations(root_path.map(PathBuf::as_path));
@@ -100,28 +182,28 @@ impl RootView {
             .flex_col()
             .bg(theme.sidebar)
             .border_r_1()
-            .border_color(theme.border)
-            .child(drag_strip("sidebar-drag", theme.sidebar).h(chrome.titlebar_height))
-            .child(
-                div()
-                    .px(px(16.0))
-                    .pt(px(2.0))
-                    .pb(px(6.0))
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_tertiary)
-                    .child("Favorites"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .px(px(8.0))
-                    .children(locations.into_iter().map(|location| {
-                        sidebar_row(location, root_path, theme, self.state.downgrade())
-                    })),
+            .border_color(theme.sidebar_border)
+            .px(px(12.0))
+            .pt(px(16.0))
+            .pb(px(16.0))
+            .gap(px(4.0))
+            .child(section_label("FAVORITES", theme))
+            .children(
+                locations.into_iter().map(|location| {
+                    sidebar_row(location, root_path, theme, self.state.downgrade())
+                }),
             )
             .child(div().flex_1())
+            .when_some(volume.cloned(), |sidebar, volume| {
+                sidebar
+                    .child(section_label("LOCATIONS", theme))
+                    .child(volume_card(
+                        volume,
+                        root_path,
+                        theme,
+                        self.state.downgrade(),
+                    ))
+            })
     }
 
     fn render_empty(&self, loading: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -134,35 +216,37 @@ impl RootView {
         let detail = if loading {
             "Checking the last complete snapshot."
         } else {
-            "Choose a favorite in the sidebar or open a folder to measure allocated space."
+            "Choose a favorite, a volume, or open a folder to measure allocated space."
         };
         let mut panel = div()
             .w(px(360.0))
             .flex()
             .flex_col()
+            .items_center()
             .child(
                 div()
-                    .text_size(px(17.0))
+                    .text_size(px(26.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(headline),
             )
             .child(
                 div()
-                    .mt(px(6.0))
+                    .mt(px(8.0))
                     .text_size(px(13.0))
                     .line_height(relative(1.4))
                     .text_color(theme.text_secondary)
+                    .text_center()
                     .child(detail),
             );
         if !loading {
             panel = panel.child(
                 div()
                     .id("empty-choose-folder")
-                    .mt(px(16.0))
-                    .h(px(21.0))
+                    .mt(px(20.0))
+                    .h(px(32.0))
                     .px(px(14.0))
-                    .rounded(px(5.0))
+                    .rounded(px(8.0))
                     .bg(theme.accent)
                     .text_color(theme.on_selection)
                     .font_weight(FontWeight::MEDIUM)
@@ -178,6 +262,8 @@ impl RootView {
             );
         }
         div()
+            .flex_1()
+            .min_w(px(0.0))
             .size_full()
             .flex()
             .items_center()
@@ -187,198 +273,235 @@ impl RootView {
             .into_any()
     }
 
-    fn render_workspace(
-        &mut self,
-        workspace: WorkspaceRender<'_>,
+    fn render_inspector(
+        &self,
+        workspace: &WorkspaceRender<'_>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let WorkspaceRender {
-            projection,
-            source,
-            hovered,
-            selected,
-            center_note,
-            finished_with_gaps,
-        } = workspace;
+    ) -> impl IntoElement {
         let theme = self.theme;
-        let focus = projection.focus_node.clone();
-        let rows = Arc::new(projection.rows.clone());
-        let row_count = rows.len();
-        let total = focus.as_ref().map_or(0, |node| node.block_size).max(1);
-        let row_state = self.state.downgrade();
+        let chrome = native_chrome();
+        let projection = workspace.projection;
+        let subject_id = workspace
+            .hovered
+            .or(workspace.selected)
+            .or(projection.focus);
+        let subject = subject_id.and_then(|id| node_view(projection, id));
+        let color = subject
+            .as_ref()
+            .and_then(|node| branch_color(projection, node.id, theme))
+            .unwrap_or(theme.folder);
+        let path = subject_id.and_then(|id| self.state.read(cx).path_of(id));
+        let crumbs = path.as_deref().map(breadcrumb_parts).unwrap_or_default();
+        let size = subject
+            .as_ref()
+            .map(|node| fmt::human_bytes(node.block_size))
+            .unwrap_or_else(|| "0 B".into());
+        let files = workspace.files;
+        let trash = workspace.trash;
+        let query = self
+            .filter
+            .as_ref()
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let ids = self.state.read(cx).ranked_child_ids();
+        let matches = query
+            .as_ref()
+            .map(|query| self.filtered_indices(&ids, query, cx));
+        let row_count = matches.as_ref().map_or(ids.len(), |indices| indices.len());
+        let selected = workspace.selected;
+        let hovered = workspace.hovered;
         let scroll = self.list_scroll.clone();
+        let list_ids = ids.clone();
+        let list_matches = matches.clone();
         let list = uniform_list(
             "content-rows",
             row_count,
-            cx.processor(move |_this, range: std::ops::Range<usize>, _window, _cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                let state = this.state.read(cx);
                 let mut elements = Vec::with_capacity(range.len());
-                for index in range {
-                    if let Some(row) = rows.get(index) {
-                        elements.push(render_row(
-                            row.clone(),
-                            total,
-                            selected == Some(row.id),
-                            hovered == Some(row.id),
-                            theme,
-                            row_state.clone(),
-                        ));
-                    }
+                for listed in range {
+                    let rank = list_matches
+                        .as_ref()
+                        .and_then(|indices| indices.get(listed).copied())
+                        .unwrap_or(listed);
+                    let Some(id) = list_ids.get(rank).copied() else {
+                        continue;
+                    };
+                    let Some(row) = state.node_view(id) else {
+                        continue;
+                    };
+                    elements.push(render_row(
+                        row,
+                        rank,
+                        selected == Some(id),
+                        hovered == Some(id),
+                        theme,
+                        this.state.downgrade(),
+                    ));
                 }
                 elements
             }),
         )
         .track_scroll(&scroll)
-        .size_full();
+        .h_full()
+        .w_full();
 
-        let focus_name = focus
+        let name = subject
             .as_ref()
-            .map(node_label)
-            .unwrap_or_else(|| "Folder".into());
-        let focus_size = fmt::human_bytes(focus.as_ref().map_or(0, |node| node.block_size));
-        let focus_items = focus.as_ref().map_or(0, |node| node.child_count);
-        let completeness = if source == DisplaySource::Cached {
-            "Cached"
-        } else if finished_with_gaps {
-            "Incomplete"
-        } else if focus.as_ref().is_some_and(|node| node.complete) {
-            "Complete"
-        } else {
-            "Calculating"
-        };
-        let status_color = if finished_with_gaps {
-            theme.danger
-        } else if source == DisplaySource::Live && focus.as_ref().is_some_and(|node| node.complete) {
-            theme.success
-        } else {
-            theme.warning
-        };
+            .map(|node| SharedString::from(node_label(node)))
+            .unwrap_or_else(|| SharedString::from("No Folder"));
+        let hint = inspector_hint(workspace.source, trash, &workspace.status, theme);
 
         div()
-            .size_full()
+            .w(chrome.inspector_width)
+            .h_full()
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(theme.inspector_border)
+            .bg(theme.inspector)
             .flex()
-            .min_h(px(0.0))
-            .bg(theme.canvas)
+            .flex_col()
+            .px(px(20.0))
+            .pt(px(20.0))
+            .pb(px(20.0))
+            .gap(px(20.0))
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .size_full()
-                    .child(self.sunburst.render(
-                        projection,
-                        hovered,
-                        selected,
-                        center_note,
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(symbol_or_mark(Glyph::Folder, 22.0, rgb_of(color), color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(17.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(name),
+                    ),
+            )
+            .child(breadcrumb(crumbs, theme, self.state.downgrade()))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .child(stat_block("SIZE", size, color, theme))
+                    .child(stat_block(
+                        "FILES",
+                        fmt::human_count(files),
+                        theme.text,
                         theme,
-                        self.state.downgrade(),
+                    ))
+                    .child(stat_block(
+                        "TRASH",
+                        trash.map(fmt::human_bytes).unwrap_or_else(|| "—".into()),
+                        theme.text_secondary,
+                        theme,
                     )),
             )
             .child(
                 div()
-                    .w(px(332.0))
-                    .h_full()
-                    .flex_shrink_0()
-                    .border_l_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface)
+                    .w_full()
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .px(px(16.0))
-                            .pt(px(16.0))
-                            .pb(px(12.0))
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .bg(theme.raised)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .size(px(6.0))
-                                            .rounded_full()
-                                            .bg(status_color),
-                                    )
-                                    .child(
-                                        div()
-                                            .ml(px(7.0))
-                                            .text_xs()
-                                            .text_color(theme.text_tertiary)
-                                            .child(completeness),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(8.0))
-                                    .text_size(px(15.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .truncate()
-                                    .child(focus_name),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(4.0))
-                                    .flex()
-                                    .items_end()
-                                    .child(
-                                        div()
-                                            .text_size(px(20.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.text)
-                                            .child(focus_size),
-                                    )
-                                    .child(
-                                        div()
-                                            .ml(px(8.0))
-                                            .mb(px(3.0))
-                                            .text_xs()
-                                            .text_color(theme.text_tertiary)
-                                            .child(format!(
-                                                "{} items",
-                                                fmt::human_count(focus_items as u64)
-                                            )),
-                                    ),
-                            ),
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("Largest Items"),
                     )
-                    .child(
-                        div()
-                            .h(px(22.0))
-                            .px(px(16.0))
-                            .flex()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .bg(theme.inset)
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text_tertiary)
-                            .child(div().flex_1().child("Name"))
-                            .child(div().w(px(48.0)))
-                            .child(div().w(px(72.0)).text_right().child("Size"))
-                            .child(div().w(px(40.0)).text_right().child("%")),
-                    )
-                    .child(div().flex_1().min_h(px(0.0)).bg(theme.surface).child(list))
-                    .when(projection.omitted_rows > 0, |panel| {
-                        panel.child(
-                            div()
-                                .h(px(26.0))
-                                .px(px(16.0))
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .flex()
-                                .items_center()
-                                .text_xs()
-                                .text_color(theme.text_tertiary)
-                                .child(format!(
-                                    "{} smaller items grouped",
-                                    fmt::human_count(projection.omitted_rows as u64)
-                                )),
-                        )
-                    }),
+                    .child(div().text_size(px(11.0)).text_color(theme.accent).child(
+                        match self.filter.as_deref() {
+                            Some("") => "Type to filter".to_string(),
+                            Some(query) => format!("Filter: {query}"),
+                            None => "Sort by size".to_string(),
+                        },
+                    )),
             )
-            .into_any()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(list),
+            )
+            .when_some(hint, |panel, hint| panel.child(hint))
+    }
+
+    fn filtered_indices(
+        &self,
+        ids: &Arc<Vec<NodeId>>,
+        query: &str,
+        cx: &Context<Self>,
+    ) -> Arc<Vec<usize>> {
+        if let Some((cached_ids, cached_query, matches)) = self.filter_matches.borrow().as_ref() {
+            if Arc::ptr_eq(cached_ids, ids) && cached_query == query {
+                return matches.clone();
+            }
+        }
+        let state = self.state.read(cx);
+        let matches = Arc::new(
+            ids.iter()
+                .enumerate()
+                .filter_map(|(index, id)| {
+                    state
+                        .node_view(*id)
+                        .filter(|row| row.display_name().to_ascii_lowercase().contains(query))
+                        .map(|_| index)
+                })
+                .collect::<Vec<_>>(),
+        );
+        *self.filter_matches.borrow_mut() = Some((ids.clone(), query.to_string(), matches.clone()));
+        matches
+    }
+
+    fn toggle_filter(&mut self, cx: &mut Context<Self>) {
+        if self.filter.is_some() {
+            self.filter = None;
+        } else {
+            self.filter = Some(String::new());
+        }
+        cx.notify();
+    }
+
+    fn handle_filter_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(query) = self.filter.as_mut() else {
+            return false;
+        };
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.alt
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "backspace" => {
+                query.pop();
+                cx.notify();
+                true
+            }
+            "escape" => {
+                self.filter = None;
+                cx.notify();
+                true
+            }
+            "up" | "down" | "enter" | "tab" => false,
+            _ => {
+                if let Some(character) = event.keystroke.key_char.as_ref() {
+                    if !character.chars().any(|unit| unit.is_control()) && character != "\r" {
+                        query.push_str(character);
+                        cx.notify();
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 }
 
@@ -386,55 +509,91 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let chrome = native_chrome();
-        let (
-            projection,
-            source,
-            hovered,
-            selected,
-            status,
-            root_path,
-            center_note,
-            finished_with_gaps,
-            can_go_up,
-        ) = {
+        let (projection, source, hovered, selected, root_path, center_note, files, trash, status) = {
             let state = self.state.read(cx);
             let projection = state.projection();
+            let subject = state.hovered.or(state.selected).or(projection.focus);
+            let files = subject
+                .map(|id| state.files_for(id, &projection))
+                .unwrap_or(0);
+            let note = state.center_note(&projection);
             let status = state.status_line(&projection);
-            let center_note = state.center_note(&projection);
             (
                 projection,
                 state.source,
                 state.hovered,
                 state.selected,
-                status,
                 state.root_path.clone(),
-                center_note,
-                !state.scanning && state.status.errors > 0,
-                state.can_go_up(),
+                note,
+                files,
+                state.trash_size(),
+                status,
             )
         };
-        let title = projection
+        let volume = volume_info(root_path.as_deref().unwrap_or(Path::new("/")));
+        let os_title = projection
             .focus_node
             .as_ref()
             .map(node_label)
             .unwrap_or_else(|| window_title(root_path.as_deref()));
-        window.set_window_title(&title);
+        window.set_window_title(&os_title);
+        let bar_title = if let Some(volume) = volume.as_ref() {
+            volume.title()
+        } else if source == DisplaySource::Loading || source == DisplaySource::Cached {
+            format!("{os_title} — scanning")
+        } else {
+            os_title
+        };
+        let focus_is_volume = volume
+            .as_ref()
+            .is_some_and(|volume| volume.is_mount(root_path.as_deref()));
+        let map_note = if focus_is_volume {
+            if let Some(volume) = volume.as_ref() {
+                format!("of {} used", fmt::human_bytes(volume.total))
+            } else {
+                center_note.to_string()
+            }
+        } else {
+            center_note.to_string()
+        };
         let loading = source == DisplaySource::Loading;
-        let content = if projection.focus.is_some() {
-            self.render_workspace(
-                WorkspaceRender {
-                    projection: &projection,
-                    source,
+        let has_map = projection.focus.is_some();
+        let workspace = WorkspaceRender {
+            projection: &projection,
+            source,
+            hovered,
+            selected,
+            center_note: SharedString::from(map_note),
+            files,
+            trash,
+            status,
+        };
+        let map = if has_map {
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .child(self.sunburst.render(
+                    &projection,
                     hovered,
                     selected,
-                    center_note,
-                    finished_with_gaps,
-                },
-                cx,
-            )
+                    workspace.center_note.clone(),
+                    theme,
+                    self.state.downgrade(),
+                ))
+                .into_any()
         } else {
             self.render_empty(loading, cx)
         };
+        let content = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .bg(theme.canvas)
+            .child(map)
+            .child(self.render_inspector(&workspace, cx))
+            .into_any();
 
         div()
             .id("daggy-root")
@@ -446,8 +605,19 @@ impl Render for RootView {
             .font_family("SF Pro Text")
             .text_color(theme.text)
             .flex()
-            .flex_row()
+            .flex_col()
+            .bg(theme.canvas)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.handle_filter_key(event, cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::GoUp, _, cx| {
+                if this.filter.take().is_some() {
+                    cx.notify();
+                    return;
+                }
+                if !this.state.read(cx).can_go_up() {
+                    return;
+                }
                 this.state.update(cx, |state, cx| state.go_up(cx));
             }))
             .on_action(cx.listener(|this, _: &crate::SelectPrevious, _, cx| {
@@ -475,6 +645,16 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &crate::OpenFolder, _, cx| {
                 this.pick_folder(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::Rescan, _, cx| {
+                this.state.update(cx, |state, cx| state.rescan(cx));
+            }))
+            .on_action(cx.listener(|this, _: &crate::ToggleSidebar, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::FocusSearch, _, cx| {
+                this.toggle_filter(cx);
+            }))
             .on_action(cx.listener(|_this, _: &crate::About, window, cx| {
                 let _ = window.prompt(
                     gpui::PromptLevel::Info,
@@ -501,128 +681,123 @@ impl Render for RootView {
             .on_action(cx.listener(|_, _: &crate::CloseWindow, window, _| {
                 window.remove_window();
             }))
-            .child(self.render_sidebar(root_path.as_ref()))
+            .child(self.render_titlebar(SharedString::from(bar_title), root_path.is_some(), cx))
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
+                    .min_h(px(0.0))
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .bg(theme.canvas)
-                    .child(
-                        drag_strip("content-drag", theme.surface)
-                            .h(chrome.titlebar_height)
-                            .px(px(12.0))
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .id("go-up")
-                                    .w(px(28.0))
-                                    .h(px(22.0))
-                                    .mr(px(8.0))
-                                    .rounded(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(16.0))
-                                    .text_color(if can_go_up {
-                                        theme.text
-                                    } else {
-                                        theme.text_ghost
-                                    })
-                                    .cursor(CursorStyle::Arrow)
-                                    .when(can_go_up, |button| {
-                                        button
-                                            .hover(|style| style.bg(theme.overlay))
-                                            .active(|style| style.opacity(0.78))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.state.update(cx, |state, cx| state.go_up(cx));
-                                            }))
-                                    })
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(symbol_or_mark(
-                                        Glyph::ChevronLeft,
-                                        11.0,
-                                        if can_go_up {
-                                            theme.icon_rgb
-                                        } else {
-                                            0xAEAEB2
-                                        },
-                                        theme.folder,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(title)),
-                            )
-                            .child(
-                                div()
-                                    .id("choose-folder")
-                                    .ml(px(12.0))
-                                    .h(px(22.0))
-                                    .px(px(8.0))
-                                    .rounded(px(5.0))
-                                    .text_color(theme.accent)
-                                    .text_size(px(13.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor(CursorStyle::Arrow)
-                                    .hover(|style| style.bg(theme.overlay))
-                                    .active(|style| style.opacity(0.78))
-                                    .on_click(cx.listener(|this, _, _, cx| this.pick_folder(cx)))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .gap(px(4.0))
-                                    .child(symbol_or_mark(
-                                        Glyph::Open,
-                                        11.0,
-                                        theme.icon_rgb,
-                                        theme.folder,
-                                    ))
-                                    .child("Open…"),
-                            ),
-                    )
-                    .child(div().flex_1().min_h(px(0.0)).child(content))
-                    .child(
-                        div()
-                            .h(px(22.0))
-                            .flex_shrink_0()
-                            .px(px(12.0))
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface)
-                            .flex()
-                            .items_center()
-                            .text_xs()
-                            .text_color(theme.text_tertiary)
-                            .child(status),
-                    ),
+                    .flex_row()
+                    .when(self.sidebar_open, |row| {
+                        row.child(self.render_sidebar(root_path.as_ref(), volume.as_ref()))
+                    })
+                    .child(content),
             )
     }
 }
 
 fn node_label(node: &NodeView) -> String {
-    display_name(std::path::Path::new(node.name.as_ref()))
+    display_name(Path::new(node.name.as_ref()))
 }
 
-fn symbol_or_mark(
+fn node_view(projection: &TreeProjection, id: NodeId) -> Option<NodeView> {
+    if let Some(node) = projection.focus_node.as_ref().filter(|node| node.id == id) {
+        return Some(node.clone());
+    }
+    if let Some(row) = projection.rows.iter().find(|row| row.id == id) {
+        return Some(row.clone());
+    }
+    projection.chart_node(id).map(|chart| chart.node.clone())
+}
+
+fn branch_color(projection: &TreeProjection, id: NodeId, theme: Theme) -> Option<Hsla> {
+    let focus = projection.focus?;
+    if id == focus {
+        return None;
+    }
+    let mut cursor = Some(id);
+    while let Some(current) = cursor {
+        if let Some(index) = projection
+            .chart_node(focus)
+            .and_then(|chart| chart.children.iter().position(|child| *child == current))
+        {
+            return Some(theme.sunburst_color(index));
+        }
+        if let Some(index) = projection.rows.iter().position(|row| row.id == current) {
+            return Some(theme.sunburst_color(index));
+        }
+        cursor = node_view(projection, current).and_then(|node| node.parent);
+        if cursor == Some(focus) {
+            break;
+        }
+    }
+    None
+}
+
+fn rgb_of(color: Hsla) -> u32 {
+    let rgba = color.to_rgb();
+    let red = (rgba.r * 255.0).round() as u32;
+    let green = (rgba.g * 255.0).round() as u32;
+    let blue = (rgba.b * 255.0).round() as u32;
+    (red << 16) | (green << 8) | blue
+}
+
+fn breadcrumb_parts(path: &Path) -> Vec<(String, PathBuf)> {
+    let mut parts = Vec::new();
+    let mut accumulated = PathBuf::new();
+    for component in path.components() {
+        accumulated.push(component.as_os_str());
+        parts.push((display_name(&accumulated), accumulated.clone()));
+    }
+    if parts.len() > 3 {
+        parts = parts.split_off(parts.len() - 3);
+    }
+    parts
+}
+
+fn section_label(label: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .px(px(8.0))
+        .pb(px(2.0))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_tertiary)
+        .child(label)
+}
+
+fn toolbar_button(
+    id: &'static str,
     glyph: Glyph,
-    size: f32,
-    color: u32,
-    fallback: gpui::Hsla,
-) -> AnyElement {
+    enabled: bool,
+    theme: Theme,
+    click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let color = if enabled {
+        theme.toolbar_icon_rgb
+    } else {
+        rgb_of(theme.text_ghost)
+    };
+    div()
+        .id(id)
+        .w(px(32.0))
+        .h(px(26.0))
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(CursorStyle::Arrow)
+        .when(enabled, |button| {
+            button
+                .hover(|style| style.bg(theme.overlay))
+                .active(|style| style.opacity(0.78))
+                .on_click(click)
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(symbol_or_mark(glyph, 15.0, color, theme.text_secondary))
+}
+
+fn symbol_or_mark(glyph: Glyph, size: f32, color: u32, fallback: Hsla) -> AnyElement {
     if let Some(icon) = sf_symbol::symbol_img(glyph, px(size), color) {
         icon.into_any()
     } else {
@@ -662,10 +837,10 @@ fn sidebar_row(
         .id(SharedString::from(format!("loc-{}", location.id)))
         .h(px(28.0))
         .px(px(8.0))
-        .mb(px(1.0))
         .rounded(px(6.0))
         .flex()
         .items_center()
+        .gap(px(8.0))
         .bg(if active {
             theme.overlay_strong
         } else {
@@ -678,20 +853,12 @@ fn sidebar_row(
             let path = path.clone();
             let _ = state.update(cx, |state, cx| state.open_path(path, cx));
         })
-        .child(
-            div()
-                .w(px(16.0))
-                .mr(px(8.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(symbol_or_mark(
-                    sf_symbol::glyph_for_location(location.id),
-                    13.0,
-                    theme.icon_rgb,
-                    theme.folder,
-                )),
-        )
+        .child(symbol_or_mark(
+            sf_symbol::glyph_for_location(location.id),
+            15.0,
+            theme.icon_rgb,
+            theme.folder,
+        ))
         .child(
             div()
                 .flex_1()
@@ -703,27 +870,239 @@ fn sidebar_row(
         )
 }
 
+fn volume_card(
+    volume: VolumeInfo,
+    current: Option<&PathBuf>,
+    theme: Theme,
+    state: gpui::WeakEntity<AppState>,
+) -> impl IntoElement {
+    let active = volume.is_mount(current.map(PathBuf::as_path));
+    let path = volume.mount.clone();
+    let share = volume.share().clamp(0.0, 1.0);
+    div()
+        .id("volume-card")
+        .w_full()
+        .rounded(px(8.0))
+        .px(px(10.0))
+        .py(px(8.0))
+        .bg(if active {
+            theme.volume_selected
+        } else {
+            gpui::transparent_black()
+        })
+        .when(active, |card| card.border_1().border_color(theme.accent))
+        .cursor(CursorStyle::Arrow)
+        .hover(|style| style.bg(theme.volume_selected))
+        .active(|style| style.opacity(0.78))
+        .on_click(move |_, _, cx| {
+            let path = path.clone();
+            let _ = state.update(cx, |state, cx| state.open_path(path, cx));
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(symbol_or_mark(Glyph::Drive, 15.0, 0x3E8EF7, theme.accent))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child(SharedString::from(volume.name.clone())),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(5.0))
+                        .rounded(px(3.0))
+                        .bg(theme.track)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(share))
+                                .rounded(px(3.0))
+                                .bg(theme.accent),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.accent)
+                                .child(format!("{} used", fmt::human_bytes(volume.used()))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_secondary)
+                                .child(format!("{} free", fmt::human_bytes(volume.free))),
+                        ),
+                ),
+        )
+}
+
+fn breadcrumb(
+    parts: Vec<(String, PathBuf)>,
+    theme: Theme,
+    state: gpui::WeakEntity<AppState>,
+) -> impl IntoElement {
+    let last = parts.len().saturating_sub(1);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .children(
+            parts
+                .into_iter()
+                .enumerate()
+                .flat_map(move |(index, (label, path))| {
+                    let state = state.clone();
+                    let is_last = index == last;
+                    let mut items = Vec::new();
+                    if index > 0 {
+                        items.push(symbol_or_mark(
+                            Glyph::ChevronRight,
+                            11.0,
+                            theme.toolbar_icon_rgb,
+                            theme.text_secondary,
+                        ));
+                    }
+                    items.push(
+                        div()
+                            .id(SharedString::from(format!("crumb-{index}")))
+                            .text_size(px(12.0))
+                            .text_color(if is_last {
+                                theme.text
+                            } else {
+                                theme.text_secondary
+                            })
+                            .cursor(CursorStyle::Arrow)
+                            .hover(|style| style.opacity(0.8))
+                            .active(|style| style.opacity(0.7))
+                            .on_click(move |_, _, cx| {
+                                let path = path.clone();
+                                let _ = state.update(cx, |state, cx| state.open_or_focus(path, cx));
+                            })
+                            .child(label)
+                            .into_any(),
+                    );
+                    items
+                }),
+        )
+}
+
+fn stat_block(
+    label: &'static str,
+    value: String,
+    value_color: Hsla,
+    theme: Theme,
+) -> impl IntoElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(18.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(value_color)
+                .child(value),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.text_secondary)
+                .child(label),
+        )
+}
+
+fn inspector_hint(
+    source: DisplaySource,
+    trash: Option<u64>,
+    status: &str,
+    theme: Theme,
+) -> Option<AnyElement> {
+    let trash_hint = trash
+        .filter(|bytes| *bytes > 0)
+        .filter(|_| source == DisplaySource::Live);
+    let (glyph, color, rgb, text) = if let Some(trash) = trash_hint {
+        (
+            Glyph::Trash,
+            theme.warning,
+            rgb_of(theme.warning),
+            format!("{} can be freed from Trash", fmt::human_bytes(trash)),
+        )
+    } else if source == DisplaySource::Cached || source == DisplaySource::Loading {
+        (
+            Glyph::Refresh,
+            theme.warning,
+            rgb_of(theme.warning),
+            status.to_string(),
+        )
+    } else if status.contains("unreadable") {
+        (
+            Glyph::Refresh,
+            theme.danger,
+            rgb_of(theme.danger),
+            status.to_string(),
+        )
+    } else {
+        return None;
+    };
+    Some(
+        div()
+            .w_full()
+            .rounded(px(8.0))
+            .px(px(12.0))
+            .py(px(10.0))
+            .bg(theme.hint)
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(symbol_or_mark(glyph, 15.0, rgb, color))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_secondary)
+                    .child(text),
+            )
+            .into_any(),
+    )
+}
+
 fn render_row(
     row: NodeView,
-    total: u64,
+    color_index: usize,
     selected: bool,
     hovered: bool,
     theme: Theme,
     state: gpui::WeakEntity<AppState>,
 ) -> AnyElement {
     let id = row.id;
-    let share = row.block_size as f32 / total as f32;
-    let percentage = if share > 0.0 && share < 0.01 {
-        "<1%".to_string()
-    } else {
-        format!("{:.0}%", share * 100.0)
-    };
     let size = format!(
         "{}{}",
         if row.complete { "" } else { "~" },
         fmt::human_bytes(row.block_size)
     );
     let name = SharedString::from(row.display_name());
+    let color = theme.sunburst_color(color_index);
     let hover_state = state.clone();
     let click_state = state;
     div()
@@ -731,27 +1110,22 @@ fn render_row(
             "content-row".into(),
             id as u64,
         ))
-        .relative()
-        .h(px(24.0))
+        .h(px(32.0))
         .w_full()
         .flex()
         .items_center()
-        .px(px(16.0))
+        .gap(px(10.0))
+        .px(px(10.0))
+        .rounded(px(6.0))
         .bg(if selected {
-            theme.selection
+            theme.overlay_strong
         } else if hovered {
             theme.overlay
         } else {
             gpui::transparent_black()
         })
         .cursor(CursorStyle::Arrow)
-        .hover(|style| {
-            if selected {
-                style
-            } else {
-                style.bg(theme.overlay)
-            }
-        })
+        .hover(|style| style.bg(theme.overlay))
         .active(|style| style.opacity(0.78))
         .on_hover(move |is_hovered, _, cx| {
             let _ = hover_state.update(cx, |state, cx| {
@@ -761,94 +1135,22 @@ fn render_row(
         .on_click(move |_, _, cx| {
             let _ = click_state.update(cx, |state, cx| state.activate_node(id, cx));
         })
-        .child(
-            div()
-                .w(px(16.0))
-                .mr(px(8.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(symbol_or_mark(
-                    if row.kind == Kind::Dir {
-                        Glyph::Folder
-                    } else {
-                        Glyph::File
-                    },
-                    13.0,
-                    if selected {
-                        0xFFFFFF
-                    } else if row.kind == Kind::Dir {
-                        theme.icon_rgb
-                    } else {
-                        0x8E8E93
-                    },
-                    if selected {
-                        theme.on_selection
-                    } else if row.kind == Kind::Dir {
-                        theme.folder
-                    } else {
-                        theme.text_ghost
-                    },
-                )),
-        )
+        .child(div().size(px(8.0)).rounded_full().bg(color).flex_shrink_0())
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
                 .text_size(px(13.0))
-                .text_color(if selected {
-                    theme.on_selection
-                } else {
-                    theme.text
-                })
+                .text_color(theme.text)
                 .child(name),
         )
         .child(
             div()
-                .w(px(48.0))
-                .h(px(4.0))
-                .rounded(px(2.0))
-                .bg(if selected {
-                    theme.on_selection.opacity(0.28)
-                } else {
-                    theme.border_strong
-                })
-                .child(
-                    div()
-                        .h_full()
-                        .w(relative(share.clamp(0.0, 1.0)))
-                        .rounded(px(2.0))
-                        .bg(if selected {
-                            theme.on_selection
-                        } else {
-                            theme.accent
-                        }),
-                ),
-        )
-        .child(
-            div()
-                .w(px(72.0))
-                .text_right()
-                .text_xs()
-                .text_color(if selected {
-                    theme.on_selection
-                } else {
-                    theme.text_secondary
-                })
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text_secondary)
                 .child(size),
-        )
-        .child(
-            div()
-                .w(px(40.0))
-                .text_right()
-                .text_xs()
-                .text_color(if selected {
-                    theme.on_selection.opacity(0.85)
-                } else {
-                    theme.text_tertiary
-                })
-                .child(percentage),
         )
         .into_any()
 }

@@ -24,6 +24,7 @@ dirs = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+libc = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

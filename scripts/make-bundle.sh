@@ -27,6 +27,13 @@ mkdir -p "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/daggy"
 cp "$ROOT/crates/daggy-app/Info.plist" "$APP/Contents/Info.plist"
+ICON="$ROOT/crates/daggy-app/Assets/AppIcon.icns"
+if [[ -f "$ICON" ]]; then
+    cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "warning: $ICON missing; bundle will use the generic icon" >&2
+    echo "run: swift $ROOT/scripts/make-icon.swift" >&2
+fi
 
 # Ad-hoc sign so Gatekeeper allows a local launch.
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || \

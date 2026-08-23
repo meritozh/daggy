@@ -52,9 +52,12 @@ Create the local application bundle:
 
 ```sh
 cargo build --release -p daggy-app
+swift scripts/make-icon.swift
 ./scripts/make-bundle.sh
 open target/release/daggy.app
 ```
+
+Push a `v*` tag to publish a GitHub Release with `daggy-macos-arm64.zip`.
 
 Benchmark a full traversal, optionally selecting one to four workers:
 

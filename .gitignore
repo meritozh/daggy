@@ -2,3 +2,4 @@
 /.zcode
 **/*.rs.bk
 .DS_Store
+crates/daggy-app/Assets/AppIcon.iconset/

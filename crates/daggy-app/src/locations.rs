@@ -1,4 +1,4 @@
-//! Finder-style favorite locations for the sidebar.
+//! Favorite folders and the current-scan location for the sidebar.
 
 use std::path::{Path, PathBuf};
 
@@ -9,9 +9,10 @@ pub struct Location {
     pub path: PathBuf,
 }
 
-/// Locations that exist on this machine, plus the current scan if it is new.
+/// Locations that exist on this machine. `current` becomes Recents when it is
+/// not already one of the named favorites.
 pub fn sidebar_locations(current: Option<&Path>) -> Vec<Location> {
-    collect_locations(system_candidates(), current)
+    collect_locations(favorite_candidates(current), None)
 }
 
 pub fn collect_locations(
@@ -63,16 +64,41 @@ pub fn window_title(path: Option<&Path>) -> String {
     path.map(display_name).unwrap_or_else(|| "Daggy".into())
 }
 
-fn system_candidates() -> Vec<Location> {
+pub fn title_bar_label(path: Option<&Path>, used: Option<(u64, u64)>) -> String {
+    let name = window_title(path);
+    match used {
+        Some((used, total)) if total > 0 => format!(
+            "{name} — {} of {} used",
+            daggy_core::fmt::human_bytes(used),
+            daggy_core::fmt::human_bytes(total)
+        ),
+        _ => name,
+    }
+}
+
+fn favorite_candidates(current: Option<&Path>) -> Vec<Location> {
     let mut candidates = Vec::new();
-    push_candidate(&mut candidates, "home", "Home", dirs::home_dir());
-    push_candidate(&mut candidates, "desktop", "Desktop", dirs::desktop_dir());
-    push_candidate(
-        &mut candidates,
-        "documents",
-        "Documents",
-        dirs::document_dir(),
-    );
+    let named = named_favorites();
+    if let Some(current) = current {
+        if current.is_dir()
+            && current.as_os_str() != "/"
+            && !named
+                .iter()
+                .any(|location| same_path(&location.path, current))
+        {
+            candidates.push(Location {
+                id: "recents",
+                name: "Recents".into(),
+                path: current.to_path_buf(),
+            });
+        }
+    }
+    candidates.extend(named);
+    candidates
+}
+
+fn named_favorites() -> Vec<Location> {
+    let mut candidates = Vec::new();
     push_candidate(
         &mut candidates,
         "downloads",
@@ -85,15 +111,13 @@ fn system_candidates() -> Vec<Location> {
         "Applications",
         Some(PathBuf::from("/Applications")),
     );
+    push_candidate(&mut candidates, "photos", "Photos", dirs::picture_dir());
+    push_candidate(&mut candidates, "movies", "Movies", dirs::video_dir());
+    push_candidate(&mut candidates, "home", "Home Folder", dirs::home_dir());
     candidates
 }
 
-fn push_candidate(
-    into: &mut Vec<Location>,
-    id: &'static str,
-    name: &str,
-    path: Option<PathBuf>,
-) {
+fn push_candidate(into: &mut Vec<Location>, id: &'static str, name: &str, path: Option<PathBuf>) {
     if let Some(path) = path {
         into.push(Location {
             id,
@@ -118,11 +142,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "daggy-locations-{}-{}",
-            std::process::id(),
-            stamp
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("daggy-locations-{}-{}", std::process::id(), stamp));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -197,5 +218,41 @@ mod tests {
             "Documents"
         );
         assert_eq!(window_title(Some(Path::new("/"))), "Macintosh HD");
+    }
+
+    #[test]
+    fn title_bar_label_includes_capacity_when_known() {
+        assert_eq!(
+            title_bar_label(
+                Some(Path::new("/")),
+                Some((486 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024))
+            ),
+            "Macintosh HD — 486 GB of 512 GB used"
+        );
+        assert_eq!(title_bar_label(None, None), "Daggy");
+    }
+
+    #[test]
+    fn favorite_candidates_use_recents_for_custom_folders() {
+        let root = scratch();
+        fs::create_dir_all(&root).unwrap();
+        let ids: Vec<&str> = favorite_candidates(Some(&root))
+            .iter()
+            .map(|location| location.id)
+            .collect();
+        assert_eq!(ids.first().copied(), Some("recents"));
+        assert!(ids.contains(&"home"));
+        assert!(!ids.contains(&"desktop"));
+        assert!(!ids.contains(&"documents"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn favorite_candidates_skip_recents_for_the_boot_volume() {
+        let ids: Vec<&str> = favorite_candidates(Some(Path::new("/")))
+            .iter()
+            .map(|location| location.id)
+            .collect();
+        assert!(!ids.contains(&"recents"));
     }
 }

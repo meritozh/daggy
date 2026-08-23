@@ -2,7 +2,8 @@
 //!
 //! Files are archived with `rkyv`, validated before access, keyed by a BLAKE3
 //! digest of the exact path bytes, and replaced atomically. A partial or failed
-//! refresh never overwrites the previous last-good snapshot.
+//! refresh never overwrites the previous last-good snapshot. Opening a folder
+//! reuses the closest ancestor snapshot that contains it.
 
 #![deny(unsafe_code)]
 
@@ -85,6 +86,51 @@ pub fn save(tree: &Tree, root_path: &Path) -> Result<()> {
 pub fn load(root_path: &Path) -> Result<Option<CacheHit>> {
     let path = cache_path(root_path).context("no cache directory available")?;
     load_from_path(root_path, &path)
+}
+
+/// Walk `path` then each parent. The first snapshot that contains `path` wins,
+/// so a Downloads cache beats a Home cache. The returned tree is rooted at
+/// `path`, extracted from an ancestor snapshot when needed.
+pub fn load_covering(path: &Path) -> Result<Option<CacheHit>> {
+    for candidate in covering_candidates(path) {
+        match load(&candidate) {
+            Ok(Some(hit)) => {
+                if let Some(hit) = hit_for_path(hit, path) {
+                    return Ok(Some(hit));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("skipping unreadable cache for {:?}: {error}", candidate);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Exact path first, then each parent up to the volume root.
+pub fn covering_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut current = Some(path);
+    while let Some(next) = current {
+        candidates.push(next.to_path_buf());
+        current = next.parent().filter(|parent| {
+            parent.as_os_str() != next.as_os_str() && !parent.as_os_str().is_empty()
+        });
+    }
+    candidates
+}
+
+fn hit_for_path(hit: CacheHit, path: &Path) -> Option<CacheHit> {
+    let id = hit.tree.find_path(path)?;
+    if hit.tree.root == Some(id) {
+        return Some(hit);
+    }
+    let tree = hit.tree.extract_subtree(id)?;
+    Some(CacheHit {
+        tree,
+        written_at_millis: hit.written_at_millis,
+    })
 }
 
 pub fn save_last_root(root: &Path) -> Result<()> {
@@ -354,6 +400,61 @@ mod tests {
     use std::ffi::OsStr;
     use std::sync::Arc;
 
+    fn nested_home(home: &Path) -> Tree {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(home.as_os_str())));
+        tree.root = Some(root);
+        let downloads = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(root),
+            Arc::from(OsStr::new("Downloads")),
+        ));
+        tree.get_mut(root).unwrap().children.push(downloads);
+        let movie = tree.alloc(Node {
+            id: 0,
+            parent: Some(downloads),
+            name: Arc::from(OsStr::new("movie.mp4")),
+            kind: Kind::File,
+            size: 8,
+            block_size: 8192,
+            mtime: 1,
+            inode: 11,
+            dev: 2,
+            state: ScanState::Scanned { child_count: 0 },
+            complete: true,
+            children: Vec::new(),
+        });
+        tree.get_mut(downloads).unwrap().children.push(movie);
+        tree.get_mut(downloads).unwrap().state = ScanState::Scanned { child_count: 1 };
+        let docs = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(root),
+            Arc::from(OsStr::new("Documents")),
+        ));
+        tree.get_mut(root).unwrap().children.push(docs);
+        let note = tree.alloc(Node {
+            id: 0,
+            parent: Some(docs),
+            name: Arc::from(OsStr::new("note.txt")),
+            kind: Kind::File,
+            size: 2,
+            block_size: 4096,
+            mtime: 2,
+            inode: 12,
+            dev: 2,
+            state: ScanState::Scanned { child_count: 0 },
+            complete: true,
+            children: Vec::new(),
+        });
+        tree.get_mut(docs).unwrap().children.push(note);
+        tree.get_mut(docs).unwrap().state = ScanState::Scanned { child_count: 1 };
+        tree.get_mut(root).unwrap().state = ScanState::Scanned { child_count: 2 };
+        tree.recompute_upward(root);
+        tree.mark_complete_upward(movie);
+        tree.mark_complete_upward(note);
+        tree
+    }
+
     fn complete_tree(root_path: &Path) -> Tree {
         let mut tree = Tree::new();
         let root = tree.alloc(Node::unscanned_dir(
@@ -481,5 +582,98 @@ mod tests {
         let left = cache_path(Path::new("/a/b_c")).unwrap();
         let right = cache_path(Path::new("/a_b/c")).unwrap();
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn covering_candidates_walk_from_leaf_to_volume() {
+        let candidates = covering_candidates(Path::new("/Users/ada/Downloads"));
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from("/Users/ada/Downloads"),
+                PathBuf::from("/Users/ada"),
+                PathBuf::from("/Users"),
+                PathBuf::from("/"),
+            ]
+        );
+    }
+
+    #[test]
+    fn covering_hit_extracts_the_closest_ancestor_subtree() {
+        let directory = temp_path("covering");
+        fs::create_dir_all(&directory).unwrap();
+        let home = directory.join("ada");
+        let downloads = home.join("Downloads");
+        let cache = directory.join("home.daggy");
+        let tree = nested_home(&home);
+        save_to_path(&tree, &home, &cache).unwrap();
+        let home_hit = load_from_path(&home, &cache).unwrap().unwrap();
+        let extracted = hit_for_path(home_hit, &downloads).expect("downloads lives under home");
+        let root = extracted.tree.root().unwrap();
+        assert_eq!(root.name.as_ref(), downloads.as_os_str());
+        assert_eq!(extracted.tree.len(), 2);
+        assert!(extracted
+            .tree
+            .find_path(&downloads.join("movie.mp4"))
+            .is_some());
+        assert!(extracted.tree.find_path(&home.join("Documents")).is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_snapshot_wins_over_an_ancestor() {
+        let directory = temp_path("closest");
+        fs::create_dir_all(&directory).unwrap();
+        let home = directory.join("ada");
+        let downloads = home.join("Downloads");
+        let home_cache = directory.join("home.daggy");
+        let downloads_cache = directory.join("downloads.daggy");
+        save_to_path(&nested_home(&home), &home, &home_cache).unwrap();
+        let mut downloads_tree = Tree::new();
+        let root = downloads_tree.alloc(Node::unscanned_dir(
+            0,
+            None,
+            Arc::from(downloads.as_os_str()),
+        ));
+        downloads_tree.root = Some(root);
+        let other = downloads_tree.alloc(Node {
+            id: 0,
+            parent: Some(root),
+            name: Arc::from(OsStr::new("other.bin")),
+            kind: Kind::File,
+            size: 1,
+            block_size: 4096,
+            mtime: 3,
+            inode: 13,
+            dev: 2,
+            state: ScanState::Scanned { child_count: 0 },
+            complete: true,
+            children: Vec::new(),
+        });
+        downloads_tree.get_mut(root).unwrap().children.push(other);
+        downloads_tree.get_mut(root).unwrap().state = ScanState::Scanned { child_count: 1 };
+        downloads_tree.recompute_upward(root);
+        downloads_tree.mark_complete_upward(other);
+        save_to_path(&downloads_tree, &downloads, &downloads_cache).unwrap();
+
+        let home_hit = load_from_path(&home, &home_cache).unwrap().unwrap();
+        let downloads_hit = load_from_path(&downloads, &downloads_cache)
+            .unwrap()
+            .unwrap();
+        let from_home = hit_for_path(home_hit, &downloads).unwrap();
+        let from_exact = hit_for_path(downloads_hit, &downloads).unwrap();
+        assert!(from_exact
+            .tree
+            .find_path(&downloads.join("other.bin"))
+            .is_some());
+        assert!(from_home
+            .tree
+            .find_path(&downloads.join("movie.mp4"))
+            .is_some());
+        assert!(from_exact
+            .tree
+            .find_path(&downloads.join("movie.mp4"))
+            .is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

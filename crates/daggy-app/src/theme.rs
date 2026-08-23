@@ -1,16 +1,15 @@
-//! macOS Human Interface Guideline tokens.
+//! Pencil design tokens for the Daggy window.
 //!
-//! Surfaces follow system window, sidebar, and content backgrounds. Interactive
-//! accent and row selection use system blue. The sunburst keeps a separate
-//! categorical palette so allocation rings stay distinguishable.
+//! Surfaces step by background lightness. The allocation map is the only
+//! saturated area. Light appearance keeps the same roles at inverted values.
 
 use gpui::{
-    hsla, point, px, rgb, size, App, Bounds, Hsla, Pixels, Point, Size,
-    TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions,
+    hsla, point, px, rgb, rgba, size, App, Bounds, Hsla, Pixels, Point, Size, TitlebarOptions,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
-pub const SIDEBAR_WIDTH: f32 = 220.0;
+pub const SIDEBAR_WIDTH: f32 = 232.0;
+pub const INSPECTOR_WIDTH: f32 = 320.0;
 pub const TITLEBAR_HEIGHT: f32 = 52.0;
 
 fn traffic_light() -> Point<Pixels> {
@@ -23,26 +22,28 @@ pub struct Theme {
     pub canvas: Hsla,
     pub sidebar: Hsla,
     pub surface: Hsla,
-    pub raised: Hsla,
-    pub inset: Hsla,
+    pub inspector: Hsla,
     pub overlay: Hsla,
     pub overlay_strong: Hsla,
     pub border: Hsla,
-    pub border_strong: Hsla,
+    pub sidebar_border: Hsla,
+    pub inspector_border: Hsla,
     pub text: Hsla,
     pub text_secondary: Hsla,
     pub text_tertiary: Hsla,
     pub text_ghost: Hsla,
     pub accent: Hsla,
-    pub selection: Hsla,
     pub on_selection: Hsla,
     pub folder: Hsla,
     pub icon_rgb: u32,
+    pub toolbar_icon_rgb: u32,
     pub warning: Hsla,
-    pub success: Hsla,
     pub danger: Hsla,
     pub sunburst: [u32; 7],
     pub sunburst_grouped: u32,
+    pub track: Hsla,
+    pub hint: Hsla,
+    pub volume_selected: Hsla,
 }
 
 impl Theme {
@@ -60,63 +61,75 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             is_dark: true,
-            canvas: rgb(0x1C1C1E).into(),
-            sidebar: rgb(0x2C2C2E).into(),
-            surface: rgb(0x1C1C1E).into(),
-            raised: rgb(0x2C2C2E).into(),
-            inset: rgb(0x1C1C1E).into(),
+            canvas: rgb(0x1E1E20).into(),
+            sidebar: rgb(0x232326).into(),
+            surface: rgb(0x1E1E20).into(),
+            inspector: rgb(0x28282B).into(),
             overlay: hsla(240.0 / 360.0, 0.02, 1.0, 0.06),
-            overlay_strong: hsla(240.0 / 360.0, 0.02, 1.0, 0.12),
-            border: hsla(240.0 / 360.0, 0.02, 1.0, 0.10),
-            border_strong: hsla(240.0 / 360.0, 0.02, 1.0, 0.16),
-            text: rgb(0xF5F5F7).into(),
-            text_secondary: rgb(0x98989D).into(),
-            text_tertiary: rgb(0x68686E).into(),
-            text_ghost: rgb(0x48484A).into(),
-            accent: rgb(0x0A84FF).into(),
-            selection: rgb(0x0A84FF).into(),
+            overlay_strong: hsla(240.0 / 360.0, 0.02, 1.0, 0.10),
+            border: rgba(0xFFFFFF14).into(),
+            sidebar_border: rgba(0xFFFFFF14).into(),
+            inspector_border: rgba(0xFFFFFF0F).into(),
+            text: rgb(0xF2F2F5).into(),
+            text_secondary: rgb(0x98989F).into(),
+            text_tertiary: rgb(0x98989F).into(),
+            text_ghost: rgb(0x6E6E76).into(),
+            accent: rgb(0x3E8EF7).into(),
             on_selection: rgb(0xFFFFFF).into(),
-            folder: rgb(0x0A84FF).into(),
-            icon_rgb: 0x0A84FF,
-            warning: rgb(0xE0B36A).into(),
-            success: rgb(0x62C987).into(),
-            danger: rgb(0xE2726A).into(),
+            folder: rgb(0x3EC6BD).into(),
+            icon_rgb: 0x3EC6BD,
+            toolbar_icon_rgb: 0x98989F,
+            warning: rgb(0xF2913E).into(),
+            danger: rgb(0xF2568C).into(),
             sunburst: [
-                0xE2795B, 0x6F8DA3, 0x7A9E7E, 0xC4A36A, 0x8B7CA8, 0x5E9BA8, 0xB57A6A,
+                0x3E8EF7, 0xF2568C, 0x3EC6BD, 0x6E6E76, 0x9A6BF2, 0xF2913E, 0xD89A2A,
             ],
-            sunburst_grouped: 0x555555,
+            sunburst_grouped: 0x5C5C64,
+            track: rgb(0x3A3A40).into(),
+            hint: rgba(0x00000040).into(),
+            volume_selected: rgba(0x3E8EF733).into(),
         }
     }
 
     pub fn light() -> Self {
         Self {
             is_dark: false,
-            canvas: rgb(0xFFFFFF).into(),
-            sidebar: rgb(0xEBEBEB).into(),
-            surface: rgb(0xFFFFFF).into(),
-            raised: rgb(0xF5F5F5).into(),
-            inset: rgb(0xFFFFFF).into(),
-            overlay: hsla(240.0 / 360.0, 0.02, 0.08, 0.05),
+            canvas: rgb(0xF4F4F6).into(),
+            sidebar: rgb(0xE8E8EC).into(),
+            surface: rgb(0xF4F4F6).into(),
+            inspector: rgb(0xFFFFFF).into(),
+            overlay: hsla(240.0 / 360.0, 0.02, 0.08, 0.06),
             overlay_strong: hsla(240.0 / 360.0, 0.02, 0.08, 0.10),
-            border: hsla(240.0 / 360.0, 0.02, 0.08, 0.10),
-            border_strong: hsla(240.0 / 360.0, 0.02, 0.08, 0.16),
+            border: rgba(0x00000014).into(),
+            sidebar_border: rgba(0x00000014).into(),
+            inspector_border: rgba(0x0000000F).into(),
             text: rgb(0x1D1D1F).into(),
             text_secondary: rgb(0x6E6E73).into(),
-            text_tertiary: rgb(0x8E8E93).into(),
+            text_tertiary: rgb(0x6E6E73).into(),
             text_ghost: rgb(0xAEAEB2).into(),
-            accent: rgb(0x007AFF).into(),
-            selection: rgb(0x007AFF).into(),
+            accent: rgb(0x3E8EF7).into(),
             on_selection: rgb(0xFFFFFF).into(),
-            folder: rgb(0x007AFF).into(),
-            icon_rgb: 0x007AFF,
-            warning: rgb(0xA66B20).into(),
-            success: rgb(0x2F8F52).into(),
-            danger: rgb(0xC64A42).into(),
+            folder: rgb(0x2AA99F).into(),
+            icon_rgb: 0x2AA99F,
+            toolbar_icon_rgb: 0x6E6E73,
+            warning: rgb(0xC47220).into(),
+            danger: rgb(0xD94A78).into(),
             sunburst: [
-                0xC85F44, 0x4F7390, 0x4F7A55, 0xA07C32, 0x6B5C8A, 0x3D7884, 0x9A5A4E,
+                0x2E7AE6, 0xD94A78, 0x2AA99F, 0x5C5C64, 0x8A5BE0, 0xD67D2E, 0xB88620,
             ],
-            sunburst_grouped: 0xB0B0B0,
+            sunburst_grouped: 0x7A7A82,
+            track: rgb(0xD8D8DE).into(),
+            hint: rgba(0x0000000A).into(),
+            volume_selected: rgba(0x3E8EF722).into(),
         }
+    }
+
+    pub fn sunburst_rgb(&self, index: usize) -> u32 {
+        self.sunburst[index % self.sunburst.len()]
+    }
+
+    pub fn sunburst_color(&self, index: usize) -> Hsla {
+        rgb(self.sunburst_rgb(index)).into()
     }
 }
 
@@ -129,6 +142,7 @@ pub struct NativeChrome {
     pub client_decorations: bool,
     pub traffic_light: Point<Pixels>,
     pub sidebar_width: Pixels,
+    pub inspector_width: Pixels,
     pub titlebar_height: Pixels,
     pub default_size: Size<Pixels>,
     pub min_size: Size<Pixels>,
@@ -141,9 +155,10 @@ pub fn native_chrome() -> NativeChrome {
         client_decorations: true,
         traffic_light: traffic_light(),
         sidebar_width: px(SIDEBAR_WIDTH),
+        inspector_width: px(INSPECTOR_WIDTH),
         titlebar_height: px(TITLEBAR_HEIGHT),
-        default_size: size(px(1180.0), px(760.0)),
-        min_size: size(px(880.0), px(560.0)),
+        default_size: size(px(1440.0), px(900.0)),
+        min_size: size(px(980.0), px(640.0)),
     }
 }
 
@@ -175,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_appearance_picks_graphite_palettes() {
+    fn system_appearance_picks_pencil_palettes() {
         let dark = Theme::from_appearance(WindowAppearance::Dark);
         let vibrant_dark = Theme::from_appearance(WindowAppearance::VibrantDark);
         let light = Theme::from_appearance(WindowAppearance::Light);
@@ -185,30 +200,49 @@ mod tests {
         assert!(vibrant_dark.is_dark);
         assert!(!light.is_dark);
         assert!(!vibrant_light.is_dark);
-        assert_eq!(dark.accent, rgb(0x0A84FF).into());
-        assert_eq!(light.accent, rgb(0x007AFF).into());
-        assert_eq!(dark.selection, rgb(0x0A84FF).into());
-        assert_eq!(light.selection, rgb(0x007AFF).into());
+        assert_eq!(dark.accent, rgb(0x3E8EF7).into());
+        assert_eq!(light.accent, rgb(0x3E8EF7).into());
+        assert_eq!(dark.canvas, rgb(0x1E1E20).into());
+        assert_eq!(dark.inspector, rgb(0x28282B).into());
+        assert_eq!(dark.sunburst[0], 0x3E8EF7);
+        assert_eq!(dark.sunburst[1], 0xF2568C);
+        assert_eq!(dark.sunburst[2], 0x3EC6BD);
+        assert_eq!(dark.sunburst[6], 0xD89A2A);
+        for &color in dark.sunburst.iter().chain(light.sunburst.iter()) {
+            let red = ((color >> 16) & 0xff) as u32;
+            let green = ((color >> 8) & 0xff) as u32;
+            let blue = color & 0xff;
+            assert!(
+                red.min(green).min(blue) < 200,
+                "{color:06x} is too close to white"
+            );
+        }
+        assert_eq!(dark.danger, rgb(0xF2568C).into());
+        assert_eq!(dark.text_tertiary, dark.text_secondary);
         assert!(dark.overlay.a > 0.0 && dark.overlay.a < 0.1);
         assert!(light.overlay.a > 0.0 && light.overlay.a < 0.1);
     }
 
     #[test]
-    fn native_chrome_uses_opaque_transparent_titlebar() {
+    fn native_chrome_matches_pencil_window() {
         let chrome = native_chrome();
         assert_eq!(chrome.background, WindowBackgroundAppearance::Opaque);
         assert!(chrome.transparent_titlebar);
         assert!(chrome.client_decorations);
         assert_eq!(chrome.traffic_light, point(px(16.0), px(20.0)));
-        assert_eq!(chrome.sidebar_width, px(220.0));
+        assert_eq!(chrome.sidebar_width, px(232.0));
+        assert_eq!(chrome.inspector_width, px(320.0));
         assert_eq!(chrome.titlebar_height, px(52.0));
+        assert_eq!(chrome.default_size, size(px(1440.0), px(900.0)));
+        assert_eq!(chrome.min_size, size(px(980.0), px(640.0)));
     }
 
     #[test]
-    fn sidebar_is_a_solid_graphite_step() {
+    fn sidebar_is_a_solid_step_off_the_canvas() {
         assert!(!Theme::dark().sidebar.is_transparent());
         assert!(!Theme::light().sidebar.is_transparent());
         assert_ne!(Theme::light().sidebar, Theme::light().canvas);
         assert_ne!(Theme::dark().sidebar, Theme::dark().canvas);
+        assert_ne!(Theme::dark().inspector, Theme::dark().canvas);
     }
 }

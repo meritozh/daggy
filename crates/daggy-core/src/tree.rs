@@ -169,6 +169,67 @@ impl Tree {
         Some(current)
     }
 
+    /// Clone `id` and its descendants into a new arena whose root name is the
+    /// full filesystem path. Ancestors of `id` are dropped so the subtree can
+    /// stand in as a scan root.
+    pub fn extract_subtree(&self, id: NodeId) -> Option<Tree> {
+        let full_path = self.path_of(id)?;
+        let source = self.get(id)?.clone();
+        let mut tree = Tree::new();
+        let mut remap = FxHashMap::default();
+        let child_ids = source.children.clone();
+        let mut root_node = source;
+        root_node.parent = None;
+        root_node.children.clear();
+        root_node.name = arc_os(full_path.into_os_string());
+        let new_root = tree.alloc(root_node);
+        tree.root = Some(new_root);
+        remap.insert(id, new_root);
+
+        let mut queue = VecDeque::from(child_ids);
+        while let Some(old) = queue.pop_front() {
+            let Some(node) = self.get(old) else {
+                continue;
+            };
+            queue.extend(node.children.iter().copied());
+            let mut cloned = node.clone();
+            cloned.parent = node.parent.and_then(|parent| remap.get(&parent).copied());
+            cloned.children.clear();
+            let new_id = tree.alloc(cloned);
+            remap.insert(old, new_id);
+        }
+        for (old, new) in &remap {
+            let Some(source) = self.get(*old) else {
+                continue;
+            };
+            let children = source
+                .children
+                .iter()
+                .filter_map(|child| remap.get(child).copied())
+                .collect();
+            if let Some(dest) = tree.get_mut(*new) {
+                dest.children = children;
+            }
+        }
+        Some(tree)
+    }
+
+    /// Children of `id`, largest allocated size first. Used by the inspector
+    /// virtual list so the UI can page through a huge directory without
+    /// cloning every `NodeView` up front.
+    pub fn ranked_child_ids(&self, id: NodeId) -> Vec<NodeId> {
+        let mut ids = self
+            .get(id)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        ids.sort_unstable_by(|left, right| {
+            let left_size = self.get(*left).map_or(0, |node| node.block_size);
+            let right_size = self.get(*right).map_or(0, |node| node.block_size);
+            right_size.cmp(&left_size).then_with(|| left.cmp(right))
+        });
+        ids
+    }
+
     /// Recompute a directory and every ancestor. Scan generations only grow,
     /// but this uses exact replacement so it also remains correct for tests and
     /// future incremental invalidation.
@@ -207,10 +268,16 @@ impl Tree {
         while let Some(current) = cursor {
             let (parent, complete) = match self.get(current) {
                 Some(node) => {
-                    let direct_done = matches!(node.state, ScanState::Scanned { .. });
+                    let direct_done = matches!(
+                        node.state,
+                        ScanState::Scanned { .. } | ScanState::Error
+                    );
                     let descendants_done = node.children.iter().all(|child| {
-                        self.get(*child)
-                            .is_some_and(|child| !child.kind.is_dir() || child.complete)
+                        self.get(*child).is_some_and(|child| {
+                            !child.kind.is_dir()
+                                || child.complete
+                                || matches!(child.state, ScanState::Error)
+                        })
                     });
                     (node.parent, direct_done && descendants_done)
                 }
@@ -466,5 +533,100 @@ mod tests {
         assert_eq!(projection.rows.len(), 2);
         assert_eq!(projection.rows[0].display_name(), "large");
         assert_eq!(projection.omitted_rows, 1);
+    }
+
+    #[test]
+    fn extract_subtree_remaps_ids_and_root_path() {
+        let mut tree = Tree::new();
+        let home = tree.alloc(Node::unscanned_dir(
+            0,
+            None,
+            Arc::from(OsStr::new("/Users/ada")),
+        ));
+        tree.root = Some(home);
+        let downloads = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(home),
+            Arc::from(OsStr::new("Downloads")),
+        ));
+        tree.get_mut(home).unwrap().children.push(downloads);
+        let nested = tree.alloc(file(downloads, "movie.mp4", 64));
+        tree.get_mut(downloads).unwrap().children.push(nested);
+        tree.get_mut(home).unwrap().state = ScanState::Scanned { child_count: 1 };
+        tree.get_mut(downloads).unwrap().state = ScanState::Scanned { child_count: 1 };
+        tree.recompute_upward(home);
+        tree.mark_complete_upward(nested);
+
+        let extracted = tree.extract_subtree(downloads).expect("downloads subtree");
+        assert_eq!(extracted.len(), 2);
+        let root = extracted.root().unwrap();
+        assert!(root.parent.is_none());
+        assert_eq!(root.name.as_ref(), OsStr::new("/Users/ada/Downloads"));
+        assert_eq!(root.children.len(), 1);
+        let child = extracted.get(root.children[0]).unwrap();
+        assert_eq!(child.display_name(), "movie.mp4");
+        assert_eq!(child.block_size, 64);
+        assert_eq!(
+            extracted.find_path(Path::new("/Users/ada/Downloads/movie.mp4")),
+            Some(root.children[0])
+        );
+        assert!(extracted.find_path(Path::new("/Users/ada")).is_none());
+        assert_eq!(
+            extracted.path_of(root.id),
+            Some(PathBuf::from("/Users/ada/Downloads"))
+        );
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn find_path_does_not_invent_ancestors() {
+        let mut tree = Tree::new();
+        let home = tree.alloc(Node::unscanned_dir(
+            0,
+            None,
+            Arc::from(OsStr::new("/Users/ada")),
+        ));
+        tree.root = Some(home);
+        assert!(tree.find_path(Path::new("/Users/ada")).is_some());
+        assert!(tree.find_path(Path::new("/Users/ada/Downloads")).is_none());
+        assert!(tree.find_path(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn unreadable_directory_does_not_block_root_completeness() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        let readable = tree.alloc(file(root, "ok", 10));
+        let denied = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(root),
+            Arc::from(OsStr::new("secret")),
+        ));
+        tree.get_mut(root).unwrap().children.extend([readable, denied]);
+        tree.get_mut(root).unwrap().state = ScanState::Scanned { child_count: 2 };
+        tree.get_mut(denied).unwrap().state = ScanState::Error;
+        tree.get_mut(denied).unwrap().complete = true;
+        tree.mark_complete_upward(denied);
+        assert!(tree.get(denied).unwrap().complete);
+        assert!(tree.root().unwrap().complete);
+        assert!(tree.is_complete());
+    }
+
+    #[test]
+    fn ranked_child_ids_are_largest_first() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        for (name, size) in [("small", 2u64), ("large", 9), ("mid", 4)] {
+            let id = tree.alloc(file(root, name, size));
+            tree.get_mut(root).unwrap().children.push(id);
+        }
+        let ranked = tree.ranked_child_ids(root);
+        let names: Vec<String> = ranked
+            .iter()
+            .map(|id| tree.get(*id).unwrap().display_name())
+            .collect();
+        assert_eq!(names, ["large", "mid", "small"]);
     }
 }

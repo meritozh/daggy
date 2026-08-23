@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "daggy-cache",
@@ -1266,6 +1266,7 @@ dependencies = [
  "dirs 5.0.1",
  "gpui",
  "gpui_platform",
+ "libc",
  "log",
  "objc",
  "parking_lot",
@@ -1275,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-cache"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1288,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "libc",
