@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "daggy-cache",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-cache"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "daggy-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "libc",
