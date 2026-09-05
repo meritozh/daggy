@@ -37,7 +37,7 @@ glass materials, or generic semantic rainbow colors.
 - Rows: 44 px, one-pixel separators, no cards. Selection changes the whole row
   surface; hover uses a quieter step.
 - Allocation map: 28% center, three visible rings, 1.2 px radial gaps, segments
-  below 0.7 degrees grouped.
+  thinner than 6 px at the ring midline grouped.
 - Status: text plus a single colored dot, never badge or pill collections.
 
 ## 5. Layout principles

@@ -358,8 +358,12 @@ impl Tree {
                         children.push(child);
                         queue.push_back((child, depth + 1));
                     } else if let Some(child) = self.get(child) {
-                        omitted_size = omitted_size.saturating_add(child.block_size);
-                        omitted_count += 1;
+                        // Files leave empty arc on the map; only leftover
+                        // directories collapse into the grouped slice.
+                        if child.kind.is_dir() {
+                            omitted_size = omitted_size.saturating_add(child.block_size);
+                            omitted_count += 1;
+                        }
                     }
                 }
             }
@@ -426,6 +430,8 @@ impl From<&Node> for NodeView {
 pub struct ChartNode {
     pub node: NodeView,
     pub children: Vec<NodeId>,
+    /// Allocated size of directories left out of `children`.
+    /// Files are omitted without being counted so the map can leave that arc empty.
     pub omitted_size: u64,
     pub omitted_count: usize,
 }
@@ -533,6 +539,39 @@ mod tests {
         assert_eq!(projection.rows.len(), 2);
         assert_eq!(projection.rows[0].display_name(), "large");
         assert_eq!(projection.omitted_rows, 1);
+    }
+
+    #[test]
+    fn projection_omits_only_directories_from_the_chart_remainder() {
+        let mut tree = Tree::new();
+        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
+        tree.root = Some(root);
+        for (name, size) in [("apps", 40), ("docs", 30)] {
+            let dir = tree.alloc(Node::unscanned_dir(
+                0,
+                Some(root),
+                Arc::from(OsStr::new(name)),
+            ));
+            tree.get_mut(root).unwrap().children.push(dir);
+            let child = tree.alloc(file(dir, "keep", size));
+            tree.get_mut(dir).unwrap().children.push(child);
+        }
+        let movie = tree.alloc(file(root, "movie.mp4", 20));
+        tree.get_mut(root).unwrap().children.push(movie);
+        let files: Vec<NodeId> = tree
+            .iter()
+            .filter(|node| !node.kind.is_dir())
+            .map(|node| node.id)
+            .collect();
+        for id in files {
+            tree.recompute_upward(id);
+        }
+
+        let projection = tree.projection(Some(root), 3, 1, 128, 8);
+        let chart = projection.chart_node(root).expect("root chart");
+        assert_eq!(chart.children.len(), 1);
+        assert_eq!(chart.omitted_count, 1);
+        assert_eq!(chart.omitted_size, 30);
     }
 
     #[test]

@@ -14,9 +14,13 @@ use crate::theme::Theme;
 
 const RINGS: usize = 3;
 const INNER_RADIUS: f32 = 0.30;
-const MIN_ANGLE: f32 = 0.7_f32.to_radians();
+/// Minimum painted arc length at a ring's midline. Filelight hides anything
+/// under ~3px and QDirStat uses a 3px tile floor; 6px leaves a clickable
+/// fill after the 1.5px slice gaps on both sides.
+const MIN_ARC_PX: f32 = 6.0;
 const RING_GAP: f32 = 1.5;
 const SLICE_GAP: f32 = 1.5;
+const FALLBACK_RADIUS: f32 = 200.0;
 
 fn ring_band(radius: Pixels, inner: f32, outer: f32) -> (Pixels, Pixels) {
     let inset = px(RING_GAP / 2.0);
@@ -34,6 +38,21 @@ fn slice_angles(inner: Pixels, outer: Pixels, start: f32, end: f32) -> (f32, f32
     } else {
         (start + half_gap, end - half_gap)
     }
+}
+
+fn chart_radius(bounds: Option<Bounds<Pixels>>) -> Pixels {
+    bounds
+        .map(|bounds| bounds.size.width.min(bounds.size.height) * 0.455)
+        .unwrap_or(px(FALLBACK_RADIUS))
+}
+
+fn ring_min_angle(radius: Pixels, depth: usize) -> f32 {
+    let ring_width = (1.0 - INNER_RADIUS) / RINGS as f32;
+    let inner = INNER_RADIUS + ring_width * depth as f32;
+    let outer = inner + ring_width;
+    let (inner, outer) = ring_band(radius, inner, outer);
+    let mid = ((inner / px(1.0)) + (outer / px(1.0))) * 0.5;
+    MIN_ARC_PX / mid.max(1.0)
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +94,8 @@ impl Sunburst {
         theme: Theme,
         state: gpui::WeakEntity<AppState>,
     ) -> impl IntoElement {
-        let wedges = Arc::new(build_wedges(projection, &theme));
+        let radius = chart_radius(self.bounds.lock().ok().and_then(|stored| *stored));
+        let wedges = Arc::new(build_wedges(projection, &theme, radius));
         let highlighted = hovered.or(selected);
         let bounds_store = self.bounds.clone();
         let paint_wedges = wedges.clone();
@@ -201,7 +221,7 @@ impl Default for Sunburst {
     }
 }
 
-fn build_wedges(projection: &TreeProjection, theme: &Theme) -> Vec<Wedge> {
+fn build_wedges(projection: &TreeProjection, theme: &Theme, radius: Pixels) -> Vec<Wedge> {
     let mut wedges = Vec::new();
     if let Some(focus) = projection.focus {
         append_children(
@@ -211,6 +231,7 @@ fn build_wedges(projection: &TreeProjection, theme: &Theme) -> Vec<Wedge> {
             std::f32::consts::TAU,
             0,
             0,
+            radius,
             theme,
             &mut wedges,
         );
@@ -225,10 +246,15 @@ fn append_children(
     end: f32,
     depth: usize,
     branch_color: usize,
+    radius: Pixels,
     theme: &Theme,
     wedges: &mut Vec<Wedge>,
 ) {
     if depth >= RINGS {
+        return;
+    }
+    let min_angle = ring_min_angle(radius, depth);
+    if end - start < min_angle {
         return;
     }
     let Some(parent) = projection.chart_node(parent) else {
@@ -237,38 +263,39 @@ fn append_children(
     if !parent.node.kind.is_dir() {
         return;
     }
+    let total = parent.node.block_size;
+    if total == 0 {
+        return;
+    }
     let children = parent
         .children
         .iter()
         .filter_map(|id| {
-            projection
-                .chart_node(*id)
-                .map(|node| (*id, node.node.block_size))
+            let node = projection.chart_node(*id)?;
+            node.node
+                .kind
+                .is_dir()
+                .then_some((*id, node.node.block_size))
         })
         .collect::<Vec<_>>();
-    let accounted = children
-        .iter()
-        .map(|(_, size)| *size)
-        .sum::<u64>()
-        .saturating_add(parent.omitted_size);
-    if accounted == 0 {
-        return;
-    }
-    let total = accounted;
 
     let ring_width = (1.0 - INNER_RADIUS) / RINGS as f32;
     let inner = INNER_RADIUS + ring_width * depth as f32;
     let outer = inner + ring_width;
+    let parent_span = end - start;
     let mut cursor = start;
     let mut grouped = parent.omitted_size;
-    for (index, (id, size)) in children.into_iter().enumerate() {
-        let span = (end - start) * size as f32 / total as f32;
-        if span < MIN_ANGLE {
+    let mut painted = 0usize;
+    for (id, size) in children {
+        let span = child_span(parent_span, size, total);
+        if span < min_angle {
             grouped = grouped.saturating_add(size);
             continue;
         }
-        let color_index = if depth == 0 { index } else { branch_color };
-        let wedge_end = cursor + span;
+        let Some(wedge_end) = clipped_end(cursor, span, end) else {
+            break;
+        };
+        let color_index = if depth == 0 { painted } else { branch_color };
         wedges.push(Wedge {
             id: Some(id),
             start: cursor,
@@ -278,7 +305,7 @@ fn append_children(
             color: ring_shade(
                 theme.sunburst[color_index % theme.sunburst.len()],
                 depth,
-                index,
+                painted,
             ),
         });
         append_children(
@@ -288,22 +315,40 @@ fn append_children(
             wedge_end,
             depth + 1,
             color_index,
+            radius,
             theme,
             wedges,
         );
         cursor = wedge_end;
+        painted += 1;
     }
     if grouped > 0 {
-        let span = (end - start) * grouped as f32 / total as f32;
-        wedges.push(Wedge {
-            id: None,
-            start: cursor,
-            end: cursor + span,
-            inner,
-            outer,
-            color: ring_shade(theme.sunburst_grouped, depth, 0),
-        });
+        let span = child_span(parent_span, grouped, total);
+        if span >= min_angle {
+            if let Some(wedge_end) = clipped_end(cursor, span, end) {
+                wedges.push(Wedge {
+                    id: None,
+                    start: cursor,
+                    end: wedge_end,
+                    inner,
+                    outer,
+                    color: ring_shade(theme.sunburst_grouped, depth, 0),
+                });
+            }
+        }
     }
+}
+
+fn child_span(parent_span: f32, size: u64, parent_size: u64) -> f32 {
+    if size == 0 || parent_size == 0 {
+        return 0.0;
+    }
+    parent_span * (size as f64 / parent_size as f64) as f32
+}
+
+fn clipped_end(start: f32, span: f32, limit: f32) -> Option<f32> {
+    let end = (start + span).min(limit);
+    (end > start).then_some(end)
 }
 
 fn hit_test(
@@ -527,60 +572,192 @@ mod tests {
         }
     }
 
-    fn file_tree(entries: &[(&str, u64)]) -> daggy_core::Tree {
+    fn alloc_dir(tree: &mut daggy_core::Tree, parent: Option<NodeId>, name: &str) -> NodeId {
         use std::ffi::OsStr;
         use std::sync::Arc;
 
-        use daggy_core::{Kind, Node, Tree};
+        use daggy_core::Node;
+
+        let id = tree.alloc(Node::unscanned_dir(
+            0,
+            parent,
+            Arc::from(OsStr::new(name)),
+        ));
+        match parent {
+            Some(parent) => tree.get_mut(parent).unwrap().children.push(id),
+            None => tree.root = Some(id),
+        }
+        id
+    }
+
+    fn alloc_file(
+        tree: &mut daggy_core::Tree,
+        parent: NodeId,
+        name: &str,
+        size: u64,
+    ) -> NodeId {
+        use std::ffi::OsStr;
+        use std::sync::Arc;
+
+        use daggy_core::{Kind, Node};
+
+        let id = tree.alloc(Node::unscanned_dir(
+            0,
+            Some(parent),
+            Arc::from(OsStr::new(name)),
+        ));
+        if let Some(node) = tree.get_mut(id) {
+            node.kind = Kind::File;
+            node.size = size;
+            node.block_size = size;
+        }
+        tree.get_mut(parent).unwrap().children.push(id);
+        id
+    }
+
+    fn settle(tree: &mut daggy_core::Tree) {
+        let files: Vec<NodeId> = tree
+            .iter()
+            .filter(|node| !node.kind.is_dir())
+            .map(|node| node.id)
+            .collect();
+        for id in files {
+            tree.recompute_upward(id);
+        }
+    }
+
+    fn file_tree(entries: &[(&str, u64)]) -> daggy_core::Tree {
+        use daggy_core::Tree;
 
         let mut tree = Tree::new();
-        let root = tree.alloc(Node::unscanned_dir(0, None, Arc::from(OsStr::new("/"))));
-        tree.root = Some(root);
+        let root = alloc_dir(&mut tree, None, "/");
         for (name, size) in entries {
-            let id = tree.alloc(Node::unscanned_dir(
-                0,
-                Some(root),
-                Arc::from(OsStr::new(*name)),
-            ));
-            if let Some(node) = tree.get_mut(id) {
-                node.kind = Kind::File;
-                node.size = *size;
-                node.block_size = *size;
-            }
-            tree.get_mut(root).unwrap().children.push(id);
+            alloc_file(&mut tree, root, name, *size);
         }
-        tree.recompute_upward(root);
+        settle(&mut tree);
         tree
     }
 
-    #[test]
-    fn files_do_not_paint_empty_outer_rings() {
-        let tree = file_tree(&[("movie.mp4", 63), ("game", 105)]);
-        let projection = tree.projection(tree.root, 3, 32, 128, 32);
-        let wedges = build_wedges(&projection, &Theme::light());
+    fn assert_near(actual: f32, expected: f32) {
         assert!(
-            wedges
-                .iter()
-                .all(|wedge| (wedge.inner - INNER_RADIUS).abs() < 0.0001),
-            "files have no nested folders, so only the inner ring should draw, got {wedges:?}"
+            (actual - expected).abs() < 0.0001,
+            "expected {expected}, got {actual}"
         );
-        assert_eq!(wedges.len(), 2);
-        assert!(wedges.iter().all(|wedge| wedge.id.is_some()));
+    }
+
+    fn map_wedges(tree: &daggy_core::Tree, branch_limit: usize) -> Vec<Wedge> {
+        let projection = tree.projection(tree.root, 3, branch_limit, 128, 32);
+        build_wedges(&projection, &Theme::light(), px(FALLBACK_RADIUS))
     }
 
     #[test]
-    fn omitted_children_share_one_grouped_slice_on_the_same_ring() {
-        let tree = file_tree(&[("a", 40), ("b", 30), ("c", 20), ("d", 10)]);
-        let projection = tree.projection(tree.root, 3, 2, 128, 32);
-        let wedges = build_wedges(&projection, &Theme::light());
+    fn files_leave_the_ring_empty() {
+        let tree = file_tree(&[("movie.mp4", 63), ("game", 105)]);
+        let wedges = map_wedges(&tree, 32);
+        assert!(
+            wedges.is_empty(),
+            "a folder of files has no directory arcs, got {wedges:?}"
+        );
+    }
+
+    #[test]
+    fn folder_arc_uses_parent_size_and_does_not_close_over_files() {
+        use daggy_core::Tree;
+
+        let mut tree = Tree::new();
+        let root = alloc_dir(&mut tree, None, "/");
+        let apps = alloc_dir(&mut tree, Some(root), "Apps");
+        alloc_file(&mut tree, apps, "App.app", 40);
+        alloc_file(&mut tree, root, "movie.mp4", 60);
+        settle(&mut tree);
+
+        let wedges = map_wedges(&tree, 32);
+        assert_eq!(wedges.len(), 1);
+        assert_near(wedges[0].start, 0.0);
+        assert_near(wedges[0].end, std::f32::consts::TAU * 0.4);
+        assert_near(wedges[0].inner, INNER_RADIUS);
+    }
+
+    #[test]
+    fn nested_folder_arc_is_relative_to_its_parent_folder() {
+        use daggy_core::Tree;
+
+        let mut tree = Tree::new();
+        let root = alloc_dir(&mut tree, None, "/");
+        let apps = alloc_dir(&mut tree, Some(root), "Apps");
+        let editor = alloc_dir(&mut tree, Some(apps), "Editor");
+        alloc_file(&mut tree, editor, "bin", 10);
+        alloc_file(&mut tree, apps, "cache.dat", 30);
+        alloc_file(&mut tree, root, "movie.mp4", 60);
+        settle(&mut tree);
+
+        let wedges = map_wedges(&tree, 32);
+        assert_eq!(wedges.len(), 2);
+
+        let ring_width = (1.0 - INNER_RADIUS) / RINGS as f32;
+        let inner = wedges
+            .iter()
+            .find(|wedge| (wedge.inner - INNER_RADIUS).abs() < 0.0001)
+            .expect("parent folder arc");
+        let nested = wedges
+            .iter()
+            .find(|wedge| (wedge.inner - (INNER_RADIUS + ring_width)).abs() < 0.0001)
+            .expect("nested folder arc");
+
+        assert_near(inner.start, 0.0);
+        assert_near(inner.end, std::f32::consts::TAU * 0.4);
+        assert_near(nested.start, 0.0);
+        assert_near(nested.end, std::f32::consts::TAU * 0.1);
+    }
+
+    #[test]
+    fn omitted_directories_share_one_grouped_slice_on_the_same_ring() {
+        use daggy_core::Tree;
+
+        let mut tree = Tree::new();
+        let root = alloc_dir(&mut tree, None, "/");
+        for (name, size) in [("a", 40), ("b", 30), ("c", 20), ("d", 10)] {
+            let dir = alloc_dir(&mut tree, Some(root), name);
+            alloc_file(&mut tree, dir, "keep", size);
+        }
+        settle(&mut tree);
+
+        let wedges = map_wedges(&tree, 2);
         let inner = wedges
             .iter()
             .filter(|wedge| (wedge.inner - INNER_RADIUS).abs() < 0.0001)
             .collect::<Vec<_>>();
         assert_eq!(inner.iter().filter(|wedge| wedge.id.is_some()).count(), 2);
         assert_eq!(inner.iter().filter(|wedge| wedge.id.is_none()).count(), 1);
-        assert!(wedges
+        let grouped = inner.iter().find(|wedge| wedge.id.is_none()).unwrap();
+        assert_near(grouped.end - grouped.start, std::f32::consts::TAU * 0.3);
+    }
+
+    #[test]
+    fn hairline_directories_collapse_into_one_grouped_slice() {
+        use daggy_core::Tree;
+
+        let mut tree = Tree::new();
+        let root = alloc_dir(&mut tree, None, "/");
+        let large = alloc_dir(&mut tree, Some(root), "large");
+        alloc_file(&mut tree, large, "keep", 92);
+        for index in 0..8 {
+            let dir = alloc_dir(&mut tree, Some(root), &format!("tiny-{index}"));
+            alloc_file(&mut tree, dir, "keep", 1);
+        }
+        settle(&mut tree);
+
+        let min_angle = ring_min_angle(px(FALLBACK_RADIUS), 0);
+        assert!(std::f32::consts::TAU * 0.01 < min_angle);
+
+        let wedges = map_wedges(&tree, 32);
+        let inner = wedges
             .iter()
-            .all(|wedge| (wedge.inner - INNER_RADIUS).abs() < 0.0001));
+            .filter(|wedge| (wedge.inner - INNER_RADIUS).abs() < 0.0001)
+            .collect::<Vec<_>>();
+        assert_eq!(inner.iter().filter(|wedge| wedge.id.is_some()).count(), 1);
+        assert_eq!(inner.iter().filter(|wedge| wedge.id.is_none()).count(), 1);
+        let grouped = inner.iter().find(|wedge| wedge.id.is_none()).unwrap();
+        assert_near(grouped.end - grouped.start, std::f32::consts::TAU * 0.08);
     }
 }
