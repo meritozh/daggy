@@ -1,0 +1,11 @@
+kind = "gpui"
+team_id = "N59353RP3W"
+bundle_id = "com.daggy.app"
+product_name = "daggy"
+channels = ["developer-id"]
+
+[gpui]
+bin = "daggy"
+package = "daggy-app"
+info_plist = "crates/daggy-app/Info.plist"
+icon = "crates/daggy-app/Assets/AppIcon.icns"
